@@ -1,121 +1,127 @@
 # Vib-Tatsuji
 
-Un motor de juego de ritmo tipo **Taiko no Tatsujin** para **PlayStation 2**,
-escrito en C con ps2sdk. Lee las canciones de un **pen USB**, con el formato
-`.tja` de open-taiko, y se juega con el tambor oficial (TaTaCon) o con mando.
+A **Taiko no Tatsujin**-style rhythm game engine for the **PlayStation 2**,
+written in C on top of ps2sdk. It loads songs from a **USB stick** in
+open-taiko's `.tja` format, and plays with the real drum controller (TaTaCon)
+or with a pad.
 
-Corre en consola de verdad, no solo en emulador.
+It runs on actual hardware, not just in an emulator.
 
-## Que hay hecho
+## What's there
 
-- **Reloj de cancion sacado del audio**, no de contar fotogramas. Las notas se
-  colocan por milisegundos y el acierto se juzga por tiempo, asi que un
-  fotograma perdido no descuadra la partitura.
-- **Lector de `.tja`**: notas normales y grandes, rodillos, globos,
-  `#BPMCHANGE`, `#MEASURE`, `#SCROLL`, `#GOGOSTART`, `#DELAY` y las partituras
-  bifurcadas (de las que se lee una rama).
-- **Recorrido del pen**: una carpeta por cancion, como las deja open-taiko.
-- **Los cuatro tipos de nota** jugables, con las ventanas de juicio del juego
-  de verdad y distintas por dificultad.
-- **Puntuacion shin'uchi**: la partitura entera vale un millon.
-- **Alma** (魂ゲージ) con la norma por dificultad y por nivel.
-- **Titulos en japones**, tirando de las fuentes de la BIOS de la consola.
-- Menus navegables **solo con el tambor**, pausa reanudable con cuenta atras,
-  calibracion de latencia, volumenes y puntuaciones guardadas en el propio pen.
+- **The song clock comes from the audio**, not from counting frames. Notes live
+  on a millisecond timeline and hits are judged in time, so a dropped frame
+  never drifts the chart out of sync with the music.
+- **`.tja` reader**: regular and big notes, drumrolls, balloons, `#BPMCHANGE`,
+  `#MEASURE`, `#SCROLL`, `#GOGOSTART`, `#DELAY`, and branching charts (one
+  branch is read).
+- **USB stick scanning**: one folder per song, the way open-taiko lays them out.
+- **All four note types** playable, with the real game's judgement windows —
+  which differ per difficulty.
+- **Shin'uchi scoring**: the whole chart is worth one million points.
+- **Soul gauge** (魂ゲージ) with the clear threshold set by difficulty and level.
+- **Japanese titles**, rendered from the console's own BIOS fonts.
+- Menus you can drive **with nothing but the drum**, a real pause with a
+  3-second countdown, latency calibration, volume settings and per-song
+  high scores — all saved on the stick itself.
 
-## Que le falta
+## What's not there yet
 
-- Las **notas grandes** valen con un solo golpe; en el juego de verdad piden
-  los dos parches del mismo color a la vez.
-- Estilo y estetica del juego, ahora mismo esta lo justo y necesario para jugar
-- No suena la muestra de la cancion en el menu, aunque el `.tja` trae el
-  `DEMOSTART` para eso.
+- **Big notes** count with a single hit; the real game asks for both patches of
+  the same colour at once.
+- **Visual style.** Right now there's just enough on screen to play.
+- No song preview in the menu, even though `.tja` files carry `DEMOSTART` for
+  exactly that.
 
-## Compilar
+## Building
 
-Hace falta Docker; el contenedor trae el toolchain de ps2dev.
+You need Docker; the container brings the ps2dev toolchain.
 
 ```sh
 docker compose run --rm dev sh -c 'make'      # motor.elf
-docker compose run --rm dev sh -c 'make iso'  # motor.iso, para OPL
+docker compose run --rm dev sh -c 'make iso'  # motor.iso, for OPL
 ```
 
-## Probar
+## Running it
 
-En consola, con **OPL** desde el disco duro: copia `motor.iso` a tu carpeta de
-DVD/CD.
+On a console, with **OPL** from a hard drive: drop `motor.iso` into your DVD/CD
+folder.
 
-En emulador:
+In an emulator:
 
 ```sh
 pcsx2-qt -batch -elf $PWD/motor.elf
 ```
 
-La ruta **absoluta** importa: PCSX2 no resuelve las relativas, arranca sin ELF
-y aborta en el recompilador con un mensaje que no dice nada de eso.
+The **absolute** path matters: PCSX2 doesn't resolve relative ones, boots with
+no ELF, and then dies inside the recompiler with a message that says nothing
+about any of that.
 
-## Poner canciones
+## Adding songs
 
-En la raiz del pen, una carpeta por cancion con su `.tja` y su `.ogg` dentro,
-que es como las deja open-taiko:
+One folder per song in the root of the stick, each with its `.tja` and its
+`.ogg` inside — exactly how open-taiko leaves them:
 
 ```
 mass0:/
-  Mi Cancion/
-    mi cancion.tja
-    mi cancion.ogg
+  My Song/
+    my song.tja
+    my song.ogg
 ```
 
-Se admite tambien una capa mas de carpetas (las de genero) y `.tja` sueltos en
-la raiz. El audio tiene que ser **Ogg Vorbis**; los `.tja` valen en UTF-8 o en
-Shift-JIS.
+One extra folder level (open-taiko's genre folders) and loose `.tja` files in
+the root both work too. Audio must be **Ogg Vorbis**; `.tja` files can be UTF-8
+or Shift-JIS.
 
-En este repo **no hay ninguna cancion**: las de prueba son musica con derechos.
+**There are no songs in this repo**: the ones used for testing are copyrighted
+music.
 
-La primera vez que arranca, el juego te ofrece calibrar la latencia con el
-metronomo. Lo que salga se guarda en `TATSUJI.CFG` **en el propio pen**, junto a
-las canciones, y las puntuaciones en un `PUNTOS.CFG` dentro de la carpeta de
-cada una: asi tus datos viajan con el pen.
+The first time it boots, the game offers to calibrate your audio latency with
+the metronome track. Whatever comes out is written to `TATSUJI.CFG` **on the
+stick itself**, next to the songs, and high scores go into a `PUNTOS.CFG` inside
+each song's own folder — so your data travels with the stick.
 
-## Los controles
+## Controls
 
-Copiados del tambor de verdad:
+Copied from the real drum:
 
-| | izquierda | derecha |
+| | left | right |
 |---|---|---|
-| **rojo** (don, parche central) | IZQUIERDA y ABAJO de la cruceta | CIRCULO y CRUZ |
-| **azul** (ka, los bordes) | L1 | R1 |
+| **red** (don, the centre skin) | D-pad LEFT and DOWN | CIRCLE and CROSS |
+| **blue** (ka, the rims) | L1 | R1 |
 
-Dos botones por color no es un capricho: es lo que permite alternar manos, y sin
-eso los cursos rapidos son fisicamente imposibles.
+Two buttons per colour isn't decoration: it's what lets you alternate hands, and
+without that the fast charts are physically impossible — Oni has 100 ms gaps and
+Edit has 50.
 
-Los menus se manejan igual: **azul** mueve, **rojo** elige. START abre las
-opciones en el selector, y la pausa durante la cancion.
+Menus work the same way: **blue** moves, **red** picks. START opens the options
+in the song selector, and the pause menu during a song.
 
-## Los ficheros
+## The files
 
 | | |
 |---|---|
-| `motor.c` | el motor entero: catalogo, menus, partida y resultados |
-| `tja.c` / `tja.h` | lector de partituras `.tja` |
-| `sjis.c` / `sjis.h` | UTF-8 a Shift-JIS para los titulos japoneses |
-| `sjis_tabla.c` | tabla generada; la hace `gen_sjis.py`, no editar a mano |
-| `prueba_tja.c` / `prueba_sjis.c` | comprobaciones que se compilan en el PC |
-| `libogg_fix/` | `framing.c` de libogg recompilado a `-O1` (ver DISENO.md) |
+| `motor.c` | the whole engine: catalogue, menus, gameplay and results |
+| `tja.c` / `tja.h` | the `.tja` chart reader |
+| `sjis.c` / `sjis.h` | UTF-8 to Shift-JIS, for the Japanese titles |
+| `sjis_tabla.c` | generated table — `gen_sjis.py` makes it, don't hand-edit |
+| `prueba_tja.c` / `prueba_sjis.c` | checks that compile and run on a PC |
+| `libogg_fix/` | libogg's `framing.c` rebuilt at `-O1` (see DISENO.md) |
 
-## Por que esta hecho asi
+## Why it's built this way
 
-En **[DISENO.md](DISENO.md)** esta lo que se midio, lo que se probo y lo que
-salio mal antes de llegar aqui: por que el reloj sale del audio y no de los
-frames, por que ningun hilo puede esperar en vacio, por que hubo que recompilar
-un fichero de libogg, de donde salen las ventanas de juicio y las cuentas de la
-puntuacion, y unas cuantas trampas mas que costaron horas.
+**[DISENO.md](DISENO.md)** *(in Spanish)* is the engineering notebook: what was
+measured, what was tried, and what broke before any of this worked. Why the
+clock comes from the audio instead of the frame counter, why no thread here can
+ever busy-wait, why one libogg source file had to be recompiled at a different
+optimisation level, where the judgement windows and the scoring maths come from,
+and a good few more traps that cost hours each.
 
-Si vas a tocar el codigo, empieza por ahi.
+If you're going to touch the code, start there.
 
-## Gracias a
+## Thanks to
 
-- [ps2dev/ps2sdk](https://github.com/ps2dev/ps2sdk), que es lo que hace que
-  esto sea posible.
-- [OpenTaiko](https://github.com/0auBSQ/OpenTaiko), de donde salen —leyendo el
-  codigo— las ventanas de juicio, el reparto de puntos y las cuentas del alma.
+- [ps2dev/ps2sdk](https://github.com/ps2dev/ps2sdk), which is what makes any of
+  this possible.
+- [OpenTaiko](https://github.com/0auBSQ/OpenTaiko) — the judgement windows, the
+  score distribution and the soul gauge maths all come from reading its source.
