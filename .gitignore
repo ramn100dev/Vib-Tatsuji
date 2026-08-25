@@ -1,0 +1,14 @@
+# --- Lo que sale de compilar ---
+*.o
+*.a
+*.elf
+*.iso
+*.map
+iso_root/
+
+# Datos empotrados: los genera el Makefile con bin2c/adpenc a partir de los
+# .irx del SDK, de los .wav y del click140.ogg, asi que no hacen falta aqui.
+*_irx.c
+*_adp.c
+click140_ogg.c
+*.adp
