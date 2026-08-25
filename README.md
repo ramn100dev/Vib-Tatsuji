@@ -27,10 +27,7 @@ Corre en consola de verdad, no solo en emulador.
 
 - Las **notas grandes** valen con un solo golpe; en el juego de verdad piden
   los dos parches del mismo color a la vez.
-- De las partituras **bifurcadas** se lee una sola rama: no se evalua la
-  condicion que hace saltar de una a otra.
-- De dibujo hay **circulos y rectangulos** y poco mas. Ni fondo, ni personaje,
-  ni texturas.
+- Estilo y estetica del juego, ahora mismo esta lo justo y necesario para jugar
 - No suena la muestra de la cancion en el menu, aunque el `.tja` trae el
   `DEMOSTART` para eso.
 
