@@ -143,6 +143,30 @@
 // la cancion) y se resincroniza de golpe en vez de arrastrar.
 #define RESYNC_MS       250
 
+// Margen antes de que arranque la cancion. Hay charts que ponen la primera
+// nota casi en el cero, y sin esto te sueltan dentro del nivel sin tiempo de
+// reaccionar. No se toca ni un tiempo de la partitura: es un silencio de
+// verdad que el hilo de audio mete DELANTE de la cancion, asi que el reloj
+// sale en negativo de la propia tuberia de audio y llega al cero solo (ver el
+// margen de entrada en hilo_audio).
+#define CUENTA_INICIO_MS  1000
+
+// Muestra del selector: cuanto suena y cuanto se lee del .ogg como mucho.
+//
+// El trozo que hay que leer NO depende de estos 8 segundos sino del DEMOSTART
+// de cada cancion, que en las charts reales anda entre 22 y 74 s. Con el tope
+// de 4 MB entran las tres de prueba (la peor necesita ~3 MB) sin acercarse a
+// comerse la RAM, que es lo que importa en una consola de 32 MB.
+#define PREVIEW_MS        8000
+// El ultimo segundo de la muestra se va bajando hasta cero. Se hace sobre las
+// MUESTRAS, no con audsrv_set_volume: asi cae justo donde toca en el flujo de
+// audio (el volumen de audsrv se aplicaria a lo que suena en ese momento, que
+// va 100-200 ms por detras de lo que se acaba de mandar) y ademas no toca el
+// ajuste de volumen del jugador, que es global.
+#define PREVIEW_FADE_MS   1000
+#define PREVIEW_MIN_BYTES (512 * 1024)
+#define PREVIEW_MAX_BYTES (4 * 1024 * 1024)
+
 // Ventanas de acierto, en milisegundos. NO son aproximadas: son las de
 // OpenTaiko (CConfigIni.cs, tabla tzLevels), que a su vez son las del taiko de
 // verdad. Tres zonas y no dos:
@@ -478,6 +502,12 @@ typedef struct {
 	char ruta_ogg[192];    // ruta completa del audio, resuelta al escanear
 	int  nivel[N_CURSOS];  // el #LEVEL de cada curso, -1 si no existe
 	int  generada;         // GEN_*: chart hecha por codigo, sin .tja ni .ogg
+	// Para la muestra del selector: donde empieza (DEMOSTART, en segundos) y
+	// cuanto dura la chart mas larga. Lo segundo no es un dato que se enseñe:
+	// sirve para estimar cuantos BYTES del .ogg hay que leer para llegar al
+	// DEMOSTART sin cargar el fichero entero (ver cargar_preview_usb).
+	float demostart;
+	int   dur_ms;
 } cancion_t;
 
 static cancion_t canciones[MAX_CANCIONES];
@@ -721,6 +751,10 @@ static int hilo_audio(void *arg)
 	int ret, bitstream, i;
 	long leido = 0;   // puede salirse del bucle antes de asignarla (parar_audio)
 	long long enviados = 0;
+	// Bytes de silencio que van delante de la cancion. Es lo que hay que
+	// restar en todas las cuentas de posicion: enviados incluye el silencio y
+	// la cancion empieza cuando se acaba.
+	long long silencio_bytes = 0;
 	int bps;
 	int en_cola_prev = 0;
 	int en_cola_max = 0;
@@ -781,7 +815,36 @@ static int hilo_audio(void *arg)
 	}
 	audsrv_set_volume(MAX_VOLUME * vol_musica / VOL_PASOS);
 
-	publicar_reloj(0);
+	//--- Margen de entrada ---
+	//
+	// El segundo que se da antes de la primera nota es un segundo de SILENCIO
+	// DE VERDAD metido delante de la cancion, no una cuenta atras fingida con
+	// el reloj parado. La diferencia importa:
+	//
+	// Con el reloj congelado y movido a mano por render, al soltarlo habia que
+	// traspasarselo al hilo de audio justo cuando la cola de audsrv todavia se
+	// estaba llenando, que es el rato en el que la medida cruda se queda
+	// pegada y publicar_reloj engancha en duro (ver reloj_estable). El reloj
+	// pegaba un escalon delante de las narices del jugador, y despues de un
+	// segundo liso se veia clarisimo: era el tiron del arranque.
+	//
+	// Mandando silencio, el reloj sale de la tuberia de audio desde el primer
+	// momento, la cola se llena DURANTE el silencio y cuando cruza el cero ya
+	// esta estable. No hay traspaso, asi que no hay escalon.
+	//
+	// En bytes y no en ms: el silencio se manda en trozos de TROZO_PCM y no
+	// cae justo en el milisegundo, asi que redondearlo dejaria un desfase fijo
+	// de hasta 10 ms en TODAS las notas. Restando los mismos bytes que se
+	// mandan, el cero de la cancion queda exacto.
+	silencio_bytes = ((long long)bps * CUENTA_INICIO_MS / 1000 / TROZO_PCM)
+	                 * TROZO_PCM;
+	memset(pcm, 0, sizeof(pcm));
+
+	// El reloj publicado ANTES de audio_listo, como siempre: main deja correr
+	// a render en cuanto ve esa bandera, y render lee el reloj en su primer
+	// fotograma. Sin esto leeria una marca a cero con ticks a cero, o sea el
+	// contador de ciclos crudo: un numero enorme y sin sentido.
+	publicar_reloj(-(silencio_bytes * 1000 / bps));
 	ticks_prev = cpu_ticks();
 	audio_listo = 1;
 
@@ -845,15 +908,23 @@ static int hilo_audio(void *arg)
 			en_cola_prev  = 0;
 			en_cola_max   = 0;
 			reloj_estable = 0;
-			descongelar_reloj(enviados * 1000 / bps);
+			descongelar_reloj((enviados - silencio_bytes) * 1000 / bps);
 
 			// Y esto lo ULTIMO, ya con el reloj republicado: es la señal de
 			// que el bucle de dibujo puede volver a leerlo.
 			pausa_activa = 0;
 		}
 
-		leido = ov_read(&vf, pcm, TROZO_PCM, 0, 2, 1, &bitstream);
-		if (leido <= 0) break;
+		// Mientras dure el margen de entrada, la fuente es el trozo a cero de
+		// arriba en vez del .ogg. Todo lo demas del bucle (cola, reloj,
+		// sonidos de golpe) es identico: para el resto del hilo el silencio
+		// es cancion como cualquier otra.
+		if (enviados < silencio_bytes) {
+			leido = TROZO_PCM;
+		} else {
+			leido = ov_read(&vf, pcm, TROZO_PCM, 0, 2, 1, &bitstream);
+			if (leido <= 0) break;
+		}
 
 		audsrv_wait_audio((int)leido);
 		audsrv_play_audio(pcm, (int)leido);
@@ -886,7 +957,7 @@ static int hilo_audio(void *arg)
 			else                       en_cola_max = en_cola;
 		}
 
-		ms = (enviados - en_cola) * 1000 / bps;
+		ms = (enviados - en_cola - silencio_bytes) * 1000 / bps;
 		publicar_reloj(ms);
 
 		// cpu_ticks es de 32 bits y da la vuelta cada ~29 s. Aqui se
@@ -919,7 +990,7 @@ static int hilo_audio(void *arg)
 		// avance al mismo ritmo que el contador de ciclos del EE: la
 		// columna "dif" tiene que quedarse acotada, no crecer.
 		if (ms >= siguiente_log_ms) {
-			long long t_bytes  = enviados * 1000 / bps;
+			long long t_bytes  = (enviados - silencio_bytes) * 1000 / bps;
 			long long t_ciclos = ticks_totales * 1000 / TICKS_POR_SEG;
 			LOG("  %7d %8d %8d %10d %11d %11d %6d\n",
 			    (int)t_bytes, (int)leer_reloj_bruto_ms(), (int)t_ciclos,
@@ -2001,8 +2072,13 @@ static int juzgar(int tipo, int ahora, int *perfectos, int *buenos, int *fallos)
 // La pausa se dibuja como las demas pantallas y por eso vive con ellas, mas
 // abajo; render la llama, asi que hace falta anunciarla aqui.
 #define PAUSA_SIGUE       0   // reanudar por donde iba
-#define PAUSA_RESULTADOS  1   // cortar la cancion y ver el resumen
-#define PAUSA_MENU        2   // dejarlo y volver al menu, sin resumen
+#define PAUSA_REINICIAR   1   // volver a empezar la misma cancion
+#define PAUSA_RESULTADOS  2   // cortar la cancion y ver el resumen
+#define PAUSA_MENU        3   // dejarlo y volver al menu, sin resumen
+
+// Lo que render() le dice a main al volver.
+#define RENDER_FIN        0   // se acabo (o se dejo): al menu
+#define RENDER_REINICIAR  1   // repetir la misma cancion y el mismo curso
 static int pantalla_pausa(framebuffer_t *frame, zbuffer_t *z,
                           packet_t *packets[2], const cancion_t *can);
 
@@ -2133,11 +2209,16 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 		// botones de la mascara. Dos golpes del mismo color en el MISMO
 		// frame cuentan como uno; a 50 Hz eso son 20 ms, muy por debajo de
 		// cualquier hueco jugable.
+		// Durante el margen de entrada NO se deja de juzgar: el reloj va en
+		// negativo pero es tiempo de cancion de verdad, asi que un golpe muy
+		// adelantado a la primera nota tiene que contar como lo que es.
 		don_pulsado = !fin && ((~btns) & prev_btns & BOTONES_DON) != 0;
 		ka_pulsado  = !fin && ((~btns) & prev_btns & BOTONES_KA)  != 0;
 
 		// START abre la pausa. Antes cortaba la cancion en seco; eso ahora
-		// es una de las dos opciones de dentro.
+		// es una de las dos opciones de dentro. Vale tambien durante el
+		// margen de entrada: el hilo de audio ya esta vivo mandando silencio,
+		// asi que hay quien conteste.
 		if (!fin && !(btns & PAD_START) && (prev_btns & PAD_START)) {
 			int r = pantalla_pausa(frame, z, packets, can);
 
@@ -2148,6 +2229,15 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 			// En los dos casos que no son reanudar hay que cortar el audio
 			// desde aqui, porque el hilo esta dormido dentro de la pausa y
 			// detener_audio es quien lo despierta.
+			if (r == PAUSA_REINICIAR) {
+				// Igual que PAUSA_MENU en lo que toca al audio (el hilo esta
+				// dormido dentro de la pausa y detener_audio es quien lo
+				// despierta), pero main vuelve a montar la misma cancion en
+				// vez de pasar por el selector.
+				detener_audio();
+				LOG("Reiniciando la cancion desde la pausa\n");
+				return RENDER_REINICIAR;
+			}
 			if (r == PAUSA_RESULTADOS) {
 				// El reloj se queda congelado a proposito: asi el fotograma
 				// que falta para llegar a resultados no puede retirar notas.
@@ -2180,13 +2270,24 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 			cal_guardada = 1;
 			guardar_config();
 		}
-		// De la pantalla de resultados se sale con START, no con CRUZ.
+		// De la pantalla de resultados se sale con el parche rojo, que es lo
+		// natural con un tambor: es el boton con el que se entra a todo lo
+		// demas. START tambien vale, y ese desde el primer fotograma.
 		//
-		// Antes era CRUZ, que era comodo porque era la misma tecla con la
-		// que se entraba. Ya no vale: CRUZ es uno de los parches rojos, y
-		// quien siga aporreando cuando acaba la cancion se saltaria los
-		// resultados sin llegar a verlos. START no se usa para tocar.
+		// El rojo NO desde el primer fotograma: quien siga aporreando cuando
+		// acaba la cancion se saltaria el resumen sin llegar a verlo. Por eso
+		// esto llego a ser solo START; con el segundo de espera se puede tener
+		// las dos cosas.
+		//
+		// Y en el metronomo, mientras quede calibracion por guardar, el rojo
+		// es el boton de guardarla (justo abajo): sale a la siguiente.
 		if (fin && !(btns & PAD_START) && (prev_btns & PAD_START)) {
+			prev_btns = btns;
+			break;
+		}
+		if (fin && frames_fin > 50 &&
+		    !(modo_calibracion && cal_disp >= 0 && !cal_guardada) &&
+		    ((~btns) & prev_btns & BOTONES_DON) != 0) {
 			prev_btns = btns;
 			break;
 		}
@@ -2425,7 +2526,7 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 				}
 			}
 
-			q = texto(q, -SEG_X, -SEG_Y, "START vuelve al menu", gris);
+			q = texto(q, -SEG_X, -SEG_Y, "ROJO vuelve al menu", gris);
 
 			q = draw_finish(q);
 			DMATAG_END(dmatag, (q - current->data) - 1, 0, 0, 0);
@@ -2660,7 +2761,7 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 		}
 	}
 
-	return 0;
+	return RENDER_FIN;
 }
 
 //---------------------------------------------------------------------
@@ -2773,6 +2874,434 @@ static unsigned char *cargar_del_usb(const char *ruta, long *tam_out,
 	LOG("%s: %s\n", ruta, ultima_carga);
 	*tam_out = tam;
 	return buf;
+}
+
+//---------------------------------------------------------------------
+// La muestra del selector
+//---------------------------------------------------------------------
+// Suena mientras se elige dificultad, desde el DEMOSTART que trae el .tja.
+//
+// La gracia esta en NO leer el .ogg entero: un Ogg Vorbis se puede abrir y
+// buscar dentro con solo el principio del fichero, porque la cabecera va
+// delante y ov_time_seek() salta por bisección sobre las paginas en vez de
+// decodificar todo lo anterior. Lo unico que hace falta es que el trozo
+// cargado LLEGUE hasta el instante al que se salta; de ahi la estimacion de
+// cuantos bytes pedir.
+//
+// El trozo no vale para jugar: esta cortado. Por eso vive en su propio buffer
+// y no en el cache de cargar_audio_de.
+// El buffer NUNCA es suyo: o es el del lector de fondo, o es el .ogg entero
+// que ya estaba en RAM de haber jugado la cancion. Por eso aqui no se libera
+// nada, solo se para el hilo.
+static unsigned char *prev_datos = NULL;
+static long           prev_tam   = 0;
+static float          prev_desde  = 0.0f;   // segundos del DEMOSTART
+static volatile int   prev_parar  = 0;
+static volatile int   prev_vivo   = 0;
+static int            prev_hilo_id = -1;
+static char           prev_ruta[192] = "";  // que .ogg esta cargado ahora
+
+//---------------------------------------------------------------------
+// El hilo lector del pen
+//---------------------------------------------------------------------
+// Lee el .ogg ENTERO a RAM, poco a poco y por detras, mientras el menu sigue
+// respondiendo. Dos cosas salen de aqui:
+//
+//   1. La muestra arranca en cuanto hay bastantes bytes para llegar al
+//      DEMOSTART, sin esperar al resto.
+//   2. Cuando se elige dificultad NO se tira nada: lo leido ya vale y solo se
+//      espera lo que falte. Elegir despues de un rato en la pantalla de
+//      dificultad es entrar casi al instante.
+//
+// Que esto funcione depende de que leer del pen DUERMA al hilo en vez de
+// girar. Comprobado con objdump sobre libfileXio: usa WaitSema/SignalSema y
+// un semaforo de fin (iSignalSema desde la interrupcion), o sea que suelta la
+// CPU mientras el IOP contesta. Es justo lo contrario de graph_wait_vsync,
+// que sondea, y por eso aqui si se puede tener un hilo esperando.
+#define TROZO_CARGA  (128 * 1024)
+
+static unsigned char  *carga_buf    = NULL;   // del tamaño del fichero entero
+static long            carga_total  = 0;
+// Cuantos bytes del principio son ya validos. Lo escribe el hilo lector y lo
+// lee el menu. No hace falta seqlock como en el reloj: es UNA palabra de 32
+// bits alineada, y en el R5900 esa carga o ese guardado no se parten.
+static volatile long   carga_validos = 0;
+static volatile int    carga_parar  = 0;
+static volatile int    carga_viva   = 0;
+static int             carga_hilo_id = -1;
+static char            carga_ruta[192] = "";
+
+// Bytes que hacen falta para poder saltar al DEMOSTART. Regla de tres entre lo
+// que dura la chart y lo que ocupa el fichero, con la mitad de margen porque
+// un Vorbis de tasa variable no reparte los bytes por igual: medido con las
+// canciones de prueba, sin ese margen el salto de una de las tres se queda
+// corto. Si aun asi no llega no pasa nada grave: el salto falla y la muestra
+// suena desde el principio.
+static long bytes_hasta_demostart(const cancion_t *c, long tam)
+{
+	int ms_nec = (int)(c->demostart * 1000.0f) + PREVIEW_MS;
+	long tope;
+
+	if (c->dur_ms > 1000 && ms_nec > 0)
+		// En 64 bits: 10 MB por 80.000 ms se sale de un entero de 32 mucho
+		// antes de llegar a la division.
+		tope = (long)(((long long)tam * ms_nec * 3) / ((long long)c->dur_ms * 2));
+	else
+		tope = PREVIEW_MAX_BYTES;
+
+	if (tope < PREVIEW_MIN_BYTES) tope = PREVIEW_MIN_BYTES;
+	if (tope > PREVIEW_MAX_BYTES) tope = PREVIEW_MAX_BYTES;
+	if (tope > tam)               tope = tam;
+	return tope;
+}
+
+static int hilo_carga(void *arg)
+{
+	FILE *f;
+	size_t n;
+
+	(void)arg;
+
+	f = fopen(carga_ruta, "rb");
+	if (f == NULL) {
+		LOG("Carga: no se pudo abrir %s\n", carga_ruta);
+		carga_viva = 0;
+		ExitDeleteThread();
+		return 0;
+	}
+
+	// Por trozos y no de una: es lo que permite abortar. Un fread de 10 MB no
+	// se puede interrumpir, asi que con trozos de 128 KB lo que se tarda en
+	// soltar la carga al volver al menu queda en ~un decimo de segundo.
+	while (!carga_parar && carga_validos < carga_total) {
+		long queda = carga_total - carga_validos;
+		long pide  = (queda > TROZO_CARGA) ? TROZO_CARGA : queda;
+
+		n = fread(carga_buf + carga_validos, 1, (size_t)pide, f);
+		if (n == 0) break;
+		carga_validos += (long)n;
+	}
+
+	fclose(f);
+	if (!carga_parar)
+		LOG("Carga: %d KB de %s\n", (int)(carga_validos / 1024), carga_ruta);
+	carga_viva = 0;
+	ExitDeleteThread();
+	return 0;
+}
+
+static void parar_preview(void);
+
+static void parar_carga(void)
+{
+	unsigned int t0;
+
+	// SIEMPRE antes de liberar: la muestra puede estar sonando desde este
+	// mismo buffer, y soltarlo con el hilo dentro es leer memoria liberada
+	// a 48.000 muestras por segundo.
+	parar_preview();
+
+	if (carga_hilo_id >= 0) {
+		carga_parar = 1;
+		// Girar aqui es seguro: el lector tiene mas prioridad que el menu y
+		// ademas duerme en cuanto pide datos, asi que avanza igual. Acotado,
+		// como todas las esperas del fichero.
+		t0 = cpu_ticks();
+		while (carga_viva &&
+		       (unsigned int)(cpu_ticks() - t0) < (unsigned int)(TICKS_POR_SEG * 3))
+			;
+		if (carga_viva) LOG("AVISO: el lector del pen no acabo a tiempo\n");
+		carga_hilo_id = -1;
+	}
+
+	if (carga_buf != NULL) free(carga_buf);
+	carga_buf     = NULL;
+	carga_total   = 0;
+	carga_validos = 0;
+	carga_ruta[0] = 0;
+}
+
+// Empieza a traerse el .ogg de la cancion. No bloquea mas que lo que cuesta
+// abrir el fichero y mirar cuanto ocupa.
+static void iniciar_carga(const cancion_t *c)
+{
+	static unsigned char pila_carga[16 * 1024] __attribute__((aligned(16)));
+	ee_thread_t th;
+	FILE *f;
+	int tid;
+
+	parar_carga();
+
+	// El .ogg de la cancion ANTERIOR se suelta antes de pedir nada: 10 MB de
+	// una mas 10 de otra no caben en una consola de 32. Aqui ya se sabe que
+	// no es la misma (el menu lo comprueba antes de llamar).
+	if (ogg_buffer != NULL) {
+		free(ogg_buffer);
+		ogg_buffer = NULL;
+		ogg_en_cache[0] = 0;
+		ogg_cache_tam = 0;
+		// Y las que apuntaban ahi tambien: aqui no las lee nadie (en el menu
+		// no existe el hilo de la cancion) y cargar_audio_de las vuelve a
+		// poner antes de crearlo, pero dejarlas colgando es una mina.
+		ogg_datos = NULL;
+		ogg_tam   = 0;
+	}
+
+	f = fopen(c->ruta_ogg, "rb");
+	if (f == NULL) return;
+	fseek(f, 0, SEEK_END);
+	carga_total = ftell(f);
+	fclose(f);
+	if (carga_total <= 0) { carga_total = 0; return; }
+
+	// Del tamaño del fichero COMPLETO desde el principio, no del trozo de la
+	// muestra: asi al elegir dificultad se sigue rellenando el mismo buffer en
+	// vez de tener que pedir otro mas grande y copiar lo ya leido.
+	carga_buf = (unsigned char *)memalign(64, (size_t)carga_total);
+	if (carga_buf == NULL) {
+		LOG("Carga: no caben %d KB para %s\n",
+		    (int)(carga_total / 1024), c->ruta_ogg);
+		carga_total = 0;
+		return;
+	}
+
+	snprintf(carga_ruta, sizeof(carga_ruta), "%s", c->ruta_ogg);
+	carga_validos = 0;
+	carga_parar   = 0;
+	carga_viva    = 1;
+
+	th.func             = hilo_carga;
+	th.stack            = pila_carga;
+	th.stack_size       = sizeof(pila_carga);
+	th.gp_reg           = &_gp;
+	// Entre el audio (0x40) y el menu (0x50): no puede quitarle el sitio a la
+	// muestra que ya este sonando, pero si adelantar al dibujo mientras copia
+	// lo que acaba de llegar del IOP.
+	th.initial_priority = 0x48;
+	th.attr             = 0;
+	th.option           = 0;
+
+	ChangeThreadPriority(GetThreadId(), 0x50);
+
+	tid = CreateThread(&th);
+	if (tid < 0) {
+		LOG("Carga: CreateThread fallo (%d)\n", tid);
+		carga_viva = 0;
+		free(carga_buf);
+		carga_buf = NULL;
+		carga_total = 0;
+		return;
+	}
+	carga_hilo_id = tid;
+	StartThread(tid, NULL);
+}
+
+// Igual que hilo_audio pero sin nada de partida: ni reloj, ni golpes, ni
+// pausa. Solo abre el trozo, salta al DEMOSTART y va soltando PCM en bucle.
+static int hilo_preview(void *arg)
+{
+	static fuente_t       fuente_p;
+	static OggVorbis_File vf_p;
+	// Alineado a 16: el desvanecido lo recorre como muestras de 16 bits, y de
+	// paso es lo que quiere el DMA que se lo lleva al IOP.
+	static char           pcm_p[TROZO_PCM] __attribute__((aligned(16)));
+	vorbis_info *info;
+	audsrv_fmt_t fmt;
+	int bitstream = 0;
+	long leido;
+	long long enviados = 0, tope_bytes, fade_bytes;
+	int bps;
+
+	(void)arg;
+
+	fuente_p.datos = prev_datos;
+	fuente_p.tam   = prev_tam;
+	fuente_p.pos   = 0;
+
+	memset(&vf_p, 0, sizeof(vf_p));
+	if (ov_open_callbacks(&fuente_p, &vf_p, NULL, 0, cbs_mem) != 0) {
+		LOG("Muestra: no se pudo abrir el trozo\n");
+		prev_vivo = 0;
+		ExitDeleteThread();
+		return 0;
+	}
+
+	info = ov_info(&vf_p, -1);
+	bps = info->rate * info->channels * 2;
+	fmt.freq     = info->rate;
+	fmt.bits     = 16;
+	fmt.channels = info->channels;
+	if (audsrv_set_format(&fmt) != 0)
+		LOG("Muestra: audsrv_set_format: %s\n", audsrv_get_error_string());
+	audsrv_set_volume(MAX_VOLUME * vol_musica / VOL_PASOS);
+
+	// Si el trozo no llega hasta el DEMOSTART (la estimacion se quedo corta,
+	// o la chart acaba mucho antes que el audio) se oye desde el principio,
+	// que es peor muestra pero mejor que el silencio.
+	if (prev_desde > 0.0f && ov_time_seek(&vf_p, (double)prev_desde) != 0) {
+		LOG("Muestra: no se llego a %d s, se oye desde el principio\n",
+		    (int)prev_desde);
+		prev_desde = 0.0f;
+		ov_raw_seek(&vf_p, 0);
+	}
+
+	tope_bytes = (long long)bps * PREVIEW_MS / 1000;
+	fade_bytes = (long long)bps * PREVIEW_FADE_MS / 1000;
+	// Por si algun dia el desvanecido se pone mas largo que la propia muestra:
+	// sin esto el factor saldria negativo y el audio, basura.
+	if (fade_bytes > tope_bytes) fade_bytes = tope_bytes;
+
+	while (!prev_parar) {
+		leido = ov_read(&vf_p, pcm_p, TROZO_PCM, 0, 2, 1, &bitstream);
+
+		// Fin del trozo cargado, o ya sonaron los segundos que toca. Suena UNA
+		// vez y se calla: en bucle se hace pesadisimo mientras eliges.
+		if (leido <= 0 || enviados >= tope_bytes) break;
+
+		// Desvanecido del final, muestra a muestra. El factor va en 0..256 y
+		// se aplica con un desplazamiento: multiplicar por los bytes que
+		// quedan directamente se saldria de un entero de 32 bits (32767 por
+		// 192000 ya no cabe).
+		if (enviados + leido > tope_bytes - fade_bytes) {
+			short *m = (short *)pcm_p;
+			int n = (int)leido / 2;   // muestras de 16 bits con signo
+			int i;
+
+			for (i = 0; i < n; i++) {
+				long long queda = tope_bytes - (enviados + (long long)i * 2);
+				int f;
+
+				if (queda <= 0)               f = 0;
+				else if (queda >= fade_bytes) f = 256;
+				else                          f = (int)(queda * 256 / fade_bytes);
+
+				m[i] = (short)(((int)m[i] * f) >> 8);
+			}
+		}
+
+		audsrv_wait_audio((int)leido);
+		if (prev_parar) break;
+		audsrv_play_audio(pcm_p, (int)leido);
+		enviados += leido;
+	}
+
+	// Y apagar bien, que no es solo dejar de mandar: al vaciarse sola, audsrv
+	// no se calla, se queda repitiendo el ultimo trozo (el mismo zumbido que
+	// salia al acabar una cancion). Pero parar en seco aqui se comeria la cola
+	// que aun no ha sonado, o sea el final de la muestra.
+	//
+	// Asi que se manda silencio hasta cubrir de sobra lo que quepa en la cola:
+	// para cuando termina, la muestra ya se ha oido entera y lo unico que
+	// queda por sonar son ceros. Entonces se para.
+	//
+	// Con audsrv_wait_audio y no con una espera en vacio, por lo de siempre:
+	// este hilo tiene mas prioridad que el del menu y girar aqui lo dejaria
+	// sin CPU.
+	if (!prev_parar) {
+		long long cola = (long long)bps * 400 / 1000;
+		long long puesto = 0;
+
+		memset(pcm_p, 0, sizeof(pcm_p));
+		while (!prev_parar && puesto < cola) {
+			audsrv_wait_audio(TROZO_PCM);
+			if (prev_parar) break;
+			audsrv_play_audio(pcm_p, TROZO_PCM);
+			puesto += TROZO_PCM;
+		}
+		audsrv_stop_audio();
+	}
+
+	ov_clear(&vf_p);
+	prev_vivo = 0;
+	ExitDeleteThread();
+	return 0;
+}
+
+static void parar_preview(void)
+{
+	unsigned int t0;
+
+	if (prev_hilo_id < 0) return;
+
+	prev_parar = 1;
+	// Aqui se puede girar en vacio: el hilo de la muestra tiene mas
+	// prioridad que este, asi que lo desaloja y avanza. Se acota igual,
+	// que es lo que hace el resto del fichero.
+	t0 = cpu_ticks();
+	while (prev_vivo &&
+	       (unsigned int)(cpu_ticks() - t0) < (unsigned int)TICKS_POR_SEG)
+		;
+	if (prev_vivo) LOG("AVISO: la muestra no solto audsrv a tiempo\n");
+	prev_hilo_id = -1;
+	// Lo que quedara en la cola del IOP, fuera: si no, se oye un cacho de
+	// la muestra por debajo de la cancion al empezar a jugar.
+	audsrv_stop_audio();
+
+	prev_datos = NULL;
+	prev_tam   = 0;
+	prev_ruta[0] = 0;
+}
+
+// Se llama en CADA fotograma de la pantalla de dificultad. No hace nada hasta
+// que el lector de fondo ha traido bastante para saltar al DEMOSTART; entonces
+// arranca la muestra y ya no vuelve a entrar.
+static void intentar_preview(const cancion_t *c)
+{
+	static unsigned char pila_prev[32 * 1024] __attribute__((aligned(16)));
+	ee_thread_t th;
+	int tid;
+
+	if (prev_hilo_id >= 0) return;                 // ya esta sonando
+	// Las generadas (metronomo, nivel de prueba) no tienen .ogg que enseñar.
+	if (c == NULL || c->generada || c->ruta_ogg[0] == 0) return;
+
+	if (ogg_buffer != NULL && strcmp(ogg_en_cache, c->ruta_ogg) == 0) {
+		// La cancion entera ya esta en RAM de haberla jugado: ni lector ni
+		// espera, y ademas el salto no se puede quedar corto.
+		prev_datos = ogg_buffer;
+		prev_tam   = ogg_cache_tam;
+	} else {
+		if (carga_buf == NULL || strcmp(carga_ruta, c->ruta_ogg) != 0) return;
+		if (carga_validos < bytes_hasta_demostart(c, carga_total)) return;
+
+		prev_datos = carga_buf;
+		// Una FOTO de lo que hay leido ahora, no el tamaño final: el lector
+		// sigue rellenando por detras y la muestra no debe mirar ahi (serian
+		// bytes sin escribir todavia). Con esto libvorbisfile trata el trozo
+		// como si el fichero acabara ahi, que para ocho segundos sobra.
+		prev_tam = carga_validos;
+	}
+
+	snprintf(prev_ruta, sizeof(prev_ruta), "%s", c->ruta_ogg);
+	prev_desde = (c->demostart > 0.0f) ? c->demostart : 0.0f;
+	prev_parar = 0;
+	prev_vivo  = 1;
+
+	th.func             = hilo_preview;
+	th.stack            = pila_prev;
+	th.stack_size       = sizeof(pila_prev);
+	th.gp_reg           = &_gp;
+	// Misma prioridad que el hilo de la cancion, y por lo mismo: el bucle del
+	// menu sondea el vsync sin dormirse, asi que con menos prioridad esta se
+	// quedaria sin CPU y se oiria a trompicones.
+	th.initial_priority = 0x40;
+	th.attr             = 0;
+	th.option           = 0;
+
+	ChangeThreadPriority(GetThreadId(), 0x50);
+
+	tid = CreateThread(&th);
+	if (tid < 0) {
+		LOG("Muestra: CreateThread fallo (%d)\n", tid);
+		// Sin liberar nada: el buffer es del lector (o del cache del .ogg),
+		// aqui solo se suelta la referencia.
+		prev_vivo  = 0;
+		prev_datos = NULL;
+		prev_tam   = 0;
+		return;
+	}
+	prev_hilo_id = tid;
+	StartThread(tid, NULL);
 }
 
 // Nota: aqui vivia cargar_del_usb_variantes(), que probaba tambien el nombre
@@ -2948,6 +3477,13 @@ static void anadir_cancion(const char *ruta_tja, const char *ruta_ogg)
 		// atoi y a correr: el numero solo se enseña.
 		c->nivel[k] = atoi(tmp.nivel);
 		cursos++;
+
+		// De la cabecera, iguales en todos los cursos: se cogen del primero
+		// que parsee. La duracion SI cambia de un curso a otro, y lo que
+		// interesa es la mas larga (es la que mejor se acerca a lo que dura
+		// el audio, que es lo que se quiere estimar).
+		if (c->demostart <= 0.0f) c->demostart = tmp.demostart;
+		if (tmp.dur_ms > c->dur_ms) c->dur_ms = tmp.dur_ms;
 		// El titulo es de la cancion, no del curso: se coge del primero que
 		// parsee bien.
 		//
@@ -3367,6 +3903,92 @@ static void pantalla_cargando(framebuffer_t *frame, zbuffer_t *z,
 	cerrar_frame(dmatag, q, paquete);
 }
 
+// Recoge lo que el lector de fondo llevara adelantado de esta cancion. Si le
+// falta poco, espera enseñando el progreso; si ya lo tiene todo, la partida
+// arranca sin leer ni un byte del pen.
+//
+// Es el punto en el que el buffer cambia de dueño: deja de ser del lector y
+// pasa a ser el .ogg de la partida, con lo que cargar_audio_de lo encuentra
+// cacheado y no vuelve a abrir el fichero.
+static void esperar_carga(framebuffer_t *frame, zbuffer_t *z,
+                          packet_t *packets[2], const cancion_t *c)
+{
+	int context = 0;
+
+	// Lo que hay cargado no es de esta cancion (o no hay nada): fuera, y que
+	// lo lea cargar_audio_de por el camino de siempre.
+	if (carga_buf == NULL || c->generada || c->ruta_ogg[0] == 0 ||
+	    strcmp(carga_ruta, c->ruta_ogg) != 0) {
+		parar_carga();
+		return;
+	}
+
+	// La espera se corta si deja de AVANZAR, no por tiempo total: un pen lento
+	// puede tardar quince segundos legitimamente en un fichero grande, y
+	// cortarle por eso seria peor que esperar. Lo que no puede pasar es
+	// quedarse aqui para siempre si la lectura se atasca, porque esta pantalla
+	// no responde a nada.
+	{
+		long ultimo = -1;
+		unsigned int t_avance = cpu_ticks();
+
+		while (carga_viva) {
+			qword_t *dmatag;
+			qword_t *q;
+			color_t blanco, amarillo;
+			char linea[80];
+			int pct;
+
+			if (carga_validos != ultimo) {
+				ultimo   = carga_validos;
+				t_avance = cpu_ticks();
+			} else if ((unsigned int)(cpu_ticks() - t_avance) >
+			           (unsigned int)(TICKS_POR_SEG * 5)) {
+				LOG("AVISO: la carga se atasco en %d KB, se lee del tiron\n",
+				    (int)(carga_validos / 1024));
+				break;
+			}
+
+			dmatag = packets[context]->data;
+			q = abrir_frame(dmatag, frame, z);
+			pct = (carga_total > 0)
+			      ? (int)((long long)carga_validos * 100 / carga_total) : 0;
+
+			blanco.r = 0x80; blanco.g = 0x80; blanco.b = 0x80;
+			blanco.a = 0x80; blanco.q = 1.0f;
+			amarillo.r = 0x80; amarillo.g = 0x80; amarillo.b = 0x00;
+			amarillo.a = 0x80; amarillo.q = 1.0f;
+
+			recorte_sjis(linea, sizeof(linea), c->titulo, 34);
+			q = texto(q, -SEG_X, 40.0f, linea, blanco);
+			snprintf(linea, sizeof(linea), "Cargando  %d%%", pct);
+			q = texto(q, -SEG_X, 0.0f, linea, amarillo);
+
+			cerrar_frame(dmatag, q, packets[context]);
+			context ^= 1;
+		}
+	}
+
+	if (!carga_viva && carga_validos >= carga_total && carga_total > 0) {
+		// Cambio de dueño. El buffer NO se libera: se lo queda el cache del
+		// .ogg, y por eso aqui se pone carga_buf a NULL antes de nada mas.
+		if (ogg_buffer != NULL) free(ogg_buffer);
+		ogg_buffer    = carga_buf;
+		ogg_cache_tam = carga_total;
+		snprintf(ogg_en_cache, sizeof(ogg_en_cache), "%s", carga_ruta);
+
+		carga_buf     = NULL;
+		carga_total   = 0;
+		carga_validos = 0;
+		carga_ruta[0] = 0;
+		LOG("Carga: la cancion ya estaba en RAM al entrar\n");
+	} else {
+		// Se quedo a medias (lectura corta o abortada): se tira y que lo lea
+		// cargar_audio_de entero, que es el camino probado.
+		parar_carga();
+	}
+}
+
 // Primera parada del catalogo con esa chart generada, o -1. Hace falta para
 // poder mandar al jugador derecho al metronomo la primera vez.
 static int indice_generada(int tipo)
@@ -3692,8 +4314,13 @@ static int pantalla_pausa(framebuffer_t *frame, zbuffer_t *z,
 	// son: terminar saca el resumen, y eso es lo unico que permite calibrar
 	// sin tragarse los dos minutos enteros del metronomo. Juntarlas obligaria
 	// a que una de las dos hiciera algo distinto de lo que dice su nombre.
-	static const char *opciones[3] = {
+	// "Reiniciar" va la segunda y no la ultima a proposito: es la que se pide
+	// a media cancion cuando algo ha salido mal, o sea con prisa, y las dos de
+	// abajo son las de dejarlo. Repetir NO vuelve a leer el .ogg del pen:
+	// cargar_audio_de lo tiene cacheado en RAM, asi que empieza en el acto.
+	static const char *opciones[4] = {
 		"REANUDAR",
+		"REINICIAR LA CANCION",
 		"TERMINAR Y VER RESULTADOS",
 		"VOLVER AL MENU"
 	};
@@ -3749,14 +4376,15 @@ static int pantalla_pausa(framebuffer_t *frame, zbuffer_t *z,
 		abajo  = !(btns & PAD_R1) && (prev_btns & PAD_R1);
 		elegir = ((~btns) & prev_btns & BOTONES_DON) != 0;
 
-		if (arriba) sel = (sel + 2) % 3;
-		if (abajo)  sel = (sel + 1) % 3;
+		if (arriba) sel = (sel + 3) % 4;
+		if (abajo)  sel = (sel + 1) % 4;
 
 		// START reanuda, que es lo que espera quien la abrio con START.
 		if (!(btns & PAD_START) && (prev_btns & PAD_START)) { sel = 0; elegir = 1; }
 
-		if (elegir && sel == 1) return PAUSA_RESULTADOS;
-		if (elegir && sel == 2) return PAUSA_MENU;
+		if (elegir && sel == 1) return PAUSA_REINICIAR;
+		if (elegir && sel == 2) return PAUSA_RESULTADOS;
+		if (elegir && sel == 3) return PAUSA_MENU;
 		if (elegir && sel == 0) break;
 
 		prev_btns = btns;
@@ -3768,10 +4396,10 @@ static int pantalla_pausa(framebuffer_t *frame, zbuffer_t *z,
 		recorte_sjis(linea, sizeof(linea), can->titulo, 40);
 		q = texto(q, -SEG_X, SEG_Y - 40.0f, linea, blanco);
 
-		for (i = 0; i < 3; i++) {
+		for (i = 0; i < 4; i++) {
 			snprintf(linea, sizeof(linea), "%c %s",
 			         (i == sel) ? '>' : ' ', opciones[i]);
-			q = texto(q, -SEG_X + 40.0f, 40.0f - i * 34.0f, linea,
+			q = texto(q, -SEG_X + 40.0f, 56.0f - i * 34.0f, linea,
 			          (i == sel) ? amarillo : blanco);
 		}
 
@@ -3906,6 +4534,11 @@ static void menu(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 	int marcas[N_CURSOS];
 	int marcas_de = -1;
 	int i;
+	// La muestra no se lanza en el mismo fotograma en que se entra en la
+	// pantalla de dificultad, sino al final de ese fotograma: leer el trozo
+	// del pen son segundos en la consola, y asi al menos la pantalla ya esta
+	// pintada mientras tanto en vez de quedarse la lista congelada.
+	int preview_pendiente = 0;
 	// 0x0000 = "todo pulsado". En libpad la logica va invertida, asi que
 	// arrancar asi hace que NINGUN boton cuente hasta que se suelte y se
 	// vuelva a pulsar. Sin esto, el parche rojo con el que se sale de la
@@ -3975,10 +4608,15 @@ static void menu(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 				                              : opcion_curso(c, -1, +1);
 				pantalla = PANT_CURSO;
 
+				// Las marcas se leen del pen AQUI, antes de que arranque la
+				// muestra: dos cosas leyendo del pen a la vez es justo lo que
+				// no puede pasar (una sola tanda de llamadas por el SIF).
 				if (marcas_de != *cursor) {
 					leer_puntos_todos(c, marcas);
 					marcas_de = *cursor;
 				}
+
+				preview_pendiente = 1;
 			}
 		} else {
 			if (arriba) sel = opcion_curso(c, sel, -1);
@@ -3986,8 +4624,18 @@ static void menu(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 
 			if (elegir) {
 				if (sel == OPC_ATRAS) {
+					// Atras SI aborta la lectura: o no se va a jugar nada, o
+					// va a ser otra cancion. Y libera, que son megas.
+					parar_carga();
+					preview_pendiente = 0;
 					pantalla = PANT_CANCION;
 				} else {
+					// La muestra se para (el hilo de la cancion va a coger
+					// audsrv y no puede haber dos dueños), pero la lectura NO
+					// se aborta: lo que lleve leido vale tal cual, porque el
+					// trozo de la muestra es el principio del mismo fichero.
+					// De eso vive esperar_carga.
+					parar_preview();
 					*curso = sel;
 					return;
 				}
@@ -4001,6 +4649,45 @@ static void menu(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 		// y main cerraba audsrv y se iba a SleepThread: en pantalla eso es
 		// exactamente un cuelgue, con el ultimo fotograma clavado y sin
 		// responder. Una PS2 no tiene a donde "salir": se apaga o se resetea.
+		// SELECT vuelve a mirar el pen, y solo desde la lista. Sirve para
+		// enchufarlo con el juego ya arrancado, o para recoger canciones que
+		// se hayan copiado despues.
+		//
+		// El aviso se pinta y se MANDA antes de escanear: si el pen no esta,
+		// catalogar_canciones se pasa hasta ocho segundos esperandolo, y como
+		// todo esto va en el hilo del menu la pantalla se queda quieta. Sin el
+		// aviso, eso se ve exactamente igual que un cuelgue.
+		if (pantalla == PANT_CANCION &&
+		    !(btns & PAD_SELECT) && (prev_btns & PAD_SELECT)) {
+			qword_t *dt2, *q2;
+
+			dt2 = packets[context]->data;
+			q2 = abrir_frame(dt2, frame, z);
+			q2 = texto(q2, -SEG_X, SEG_Y, "BUSCANDO EL PEN...", amarillo);
+			q2 = texto(q2, -SEG_X, SEG_Y - 40.0f,
+			           "Si no esta puesto, esto tarda unos segundos.", gris);
+			cerrar_frame(dt2, q2, packets[context]);
+			context ^= 1;
+
+			// Rehace el catalogo entero: empieza poniendo n_canciones a cero y
+			// ya se encarga de ordenar y de volver a poner las generadas al
+			// final, asi que no hay nada que limpiar antes. La lectura de
+			// fondo si hay que cortarla: va a leer del pen igual que el
+			// escaneo, y solo puede haber uno.
+			parar_carga();
+			catalogar_canciones();
+
+			// El cursor puede haberse quedado apuntando a una cancion que ya
+			// no esta, o a un hueco detras de la lista nueva.
+			if (*cursor >= n_visibles) *cursor = 0;
+			marcas_de = -1;          // las marcas cacheadas son de la lista vieja
+			pantalla  = PANT_CANCION;
+			preview_pendiente = 0;
+
+			prev_btns = 0x0000;
+			continue;
+		}
+
 		if (pantalla == PANT_CANCION &&
 		    !(btns & PAD_START) && (prev_btns & PAD_START)) {
 			int acc = pantalla_opciones(frame, z, packets);
@@ -4009,6 +4696,12 @@ static void menu(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 				int g = indice_generada((acc == ACC_METRONOMO)
 				                        ? GEN_METRONOMO : GEN_PRUEBA);
 				if (g >= 0) {
+					// Se sale derecho a jugar, asi que audsrv tiene que
+					// quedar libre y el pen tambien. Aqui no deberia haber
+					// nada de eso vivo (las opciones solo se abren desde la
+					// lista), pero esto es lo que hace que siga siendo verdad
+					// si algun dia se abren desde otro sitio.
+					parar_carga();
 					*cursor = g;
 					*curso  = 0;   // las generadas solo tienen un curso
 					return;
@@ -4091,7 +4784,8 @@ static void menu(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 			// se las come el borde. En PCSX2 se ven perfectamente, que es
 			// justo lo que hace peligroso este tipo de fallo.
 			q = texto(q, -SEG_X, -SEG_Y + 44.0f,
-			          "AZUL (L1/R1) mueve   ROJO elige", gris);
+			          "AZUL (L1/R1) mueve   ROJO elige   SELECT relee el pen",
+			          gris);
 		} else {
 			q = texto(q, -SEG_X, SEG_Y, "DIFICULTAD", amarillo);
 			recorte_sjis(corte, sizeof(corte), c->titulo, 34);
@@ -4172,6 +4866,25 @@ static void menu(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 
 		cerrar_frame(dmatag, q, packets[context]);
 		context ^= 1;
+
+		// Al entrar en la pantalla de dificultad se lanza el lector de fondo,
+		// UNA vez. Solo cuesta abrir el fichero y mirar cuanto ocupa; leerlo
+		// es cosa del otro hilo, que duerme esperando al pen mientras este
+		// sigue dibujando.
+		//
+		// Si la cancion ya esta entera en RAM (se acaba de jugar) no hay nada
+		// que leer: intentar_preview tira de ahi directamente.
+		if (preview_pendiente) {
+			preview_pendiente = 0;
+			if (!(ogg_buffer != NULL &&
+			      strcmp(ogg_en_cache, c->ruta_ogg) == 0) &&
+			    !c->generada && c->ruta_ogg[0] != 0)
+				iniciar_carga(c);
+		}
+
+		// Y en cada vuelta se mira si ya hay bastante para arrancar la
+		// muestra. No hace nada hasta que lo hay, y nada mas una vez.
+		if (pantalla == PANT_CURSO) intentar_preview(c);
 	}
 }
 
@@ -4184,6 +4897,7 @@ int main(int argc, char *argv[])
 	int cursor = 0, curso = 0;
 	int vueltas = 0;
 	int saltar_menu = 0;
+	int fin_render = RENDER_FIN;
 
 	(void)argc; (void)argv;
 
@@ -4303,6 +5017,10 @@ int main(int argc, char *argv[])
 		// El aviso se manda antes de abrir nada: leer del pen para el
 		// bucle de dibujo varios segundos.
 		pantalla_cargando(&frame, &z, packets[0], c);
+		// Recoge lo que el lector de fondo llevara adelantado mientras se
+		// elegia la dificultad. Si le dio tiempo a acabar, cargar_audio_de no
+		// lee nada: se lo encuentra ya en RAM.
+		esperar_carga(&frame, &z, packets, c);
 		cargar_audio_de(c);
 
 		// La chart se vuelve a parsear en cada partida porque el catalogo
@@ -4374,12 +5092,17 @@ int main(int argc, char *argv[])
 			generar_chart(duracion_ms);
 		}
 
-		render(&frame, &z, packets, c, curso);
+		fin_render = render(&frame, &z, packets, c, curso);
 
 		// Y aqui se cierra el ciclo. Parar el audio limpiamente es lo unico
 		// que hacia falta para poder volver al menu: audsrv_init y las
 		// muestras ADPCM se quedan como estan, solo se rehace el hilo.
 		detener_audio();
+
+		// Reiniciar es volver a dar la vuelta con el mismo cursor y el mismo
+		// curso, saltandose el selector. Todo lo de arriba se rehace: chart,
+		// hilo de audio y estado de la partida. El .ogg no, que ya esta en RAM.
+		if (fin_render == RENDER_REINICIAR) saltar_menu = 1;
 	}
 
 	/* Del ciclo de arriba no se sale: no hay "salir" en una PS2. */

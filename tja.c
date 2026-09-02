@@ -194,6 +194,10 @@ int tja_parsear(const char *datos, long tam, const char *curso_pedido,
 						out->bpm = (float)atof(valor);
 					else if (igual_sin_mayus(clave, "OFFSET"))
 						out->offset = (float)atof(valor);
+					// Va con las claves de cabecera (fuera de los cursos): la
+					// muestra es de la cancion, no de la dificultad.
+					else if (igual_sin_mayus(clave, "DEMOSTART"))
+						out->demostart = (float)atof(valor);
 					else if (igual_sin_mayus(clave, "LEVEL") && en_curso)
 						copiar_recortado(out->nivel, sizeof(out->nivel),
 						                 dosp + 1, fin);

@@ -53,6 +53,12 @@ typedef struct {
 	float offset;        // segundos, tal cual viene en el fichero
 	char  curso[16];
 	char  nivel[8];
+	// DEMOSTART: el segundo de la cancion donde empieza la muestra que suena
+	// en el selector. Lo pone quien hizo la chart y NO suele ser 0: las tres
+	// canciones de prueba lo tienen en 22, 50 y 74 s, saltandose la intro a
+	// proposito. 0 = no venia en el fichero, y entonces se oye desde el
+	// principio.
+	float demostart;
 
 	tja_nota_t notas[TJA_MAX_NOTAS];
 	int n_notas;
