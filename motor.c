@@ -293,12 +293,19 @@ static const int ventanas_duras[3]   = {  25,    75,   108 };  // Dificil, Oni, 
 #define RUIDO_MASCARA    (RUIDO_N - 1)
 // 180 ms entre valores: unas cinco ondulaciones por segundo.
 #define RUIDO_PERIODO_MS 180.0f
-// Valores de partida, en pixeles. Se guardan en el pen y se tocan en plena
-// cancion con SELECT y L2/R2.
-#define RUIDO_BASE_PX    1.2f
-#define RUIDO_MUSICA_PX  0.6f
-#define PASO_BASE        0.1f
-#define PASO_MUSICA      0.1f
+// Amplitud del temblor, en pixeles. FIJA en el codigo y la misma para todo el
+// mundo: es parte de como se ve el juego, no una preferencia del jugador.
+//
+// Llegaron a estar en el fichero de ajustes del pen, cuando habia botones
+// para moverlos dentro de la cancion y tenia sentido guardar lo que afinabas.
+// Al quitar esos botones, dejarlo en el pen solo conseguia que el juego se
+// viera distinto segun el pen que metieras, sin forma de cambiarlo.
+//
+// 0,3 y 0,3 salen de afinarlo en la consola: por debajo no se nota vivo y por
+// encima las figuras pequenas (un ojo del personaje mide ~10 px) se
+// retuercen en vez de vibrar.
+#define RUIDO_BASE_PX    0.3f
+#define RUIDO_MUSICA_PX  0.3f
 
 // Cuanto se multiplica lo que aporta la musica dentro del Gogo Time.
 //
@@ -318,8 +325,6 @@ static const int ventanas_duras[3]   = {  25,    75,   108 };  // Dificil, Oni, 
 // deja de parecer un efecto y empieza a parecer un fallo.
 #define COMBO_TEMBLOR    1.6f
 #define COMBO_TOPE       50
-#define TOPE_BASE        6.0f
-#define TOPE_MUSICA      3.0f
 
 // Como se dibuja una nota. El disco se lee mejor con las notas viniendo
 // rapido; el anillo es mas fiel al estilo. Se elige en las opciones.
@@ -536,8 +541,6 @@ static int vol_sonido = VOL_PASOS;
 
 // Estilo de dibujo. Vive en el fichero de ajustes del pen como todo lo demas.
 static int estilo_nota  = ESTILO_DISCO;
-static float ruido_base   = RUIDO_BASE_PX;
-static float ruido_musica = RUIDO_MUSICA_PX;
 // Amplitud que sale de verdad ahora mismo: base + musica * energia. La
 // calcula el bucle de dibujo en cada fotograma y la usan las primitivas.
 static float amp_temblor  = RUIDO_BASE_PX;
@@ -2231,20 +2234,11 @@ static void cargar_config(void)
 	leer_clave(buf, "musica=", &vol_musica, 0, VOL_PASOS);
 	leer_clave(buf, "sonido=", &vol_sonido, 0, VOL_PASOS);
 
-	// El estilo y el temblor. En centesimas de pixel porque el fichero es de
-	// enteros; las claves que no esten se quedan como estaban, asi que un
-	// perfil viejo sigue valiendo y estos salen con su valor de fabrica.
-	{
-		int v;
-
-		leer_clave(buf, "estilo=", &estilo_nota, 0, 1);
-		v = (int)(ruido_base * 100.0f);
-		if (leer_clave(buf, "ruido=", &v, 0, (int)(TOPE_BASE * 100.0f)))
-			ruido_base = (float)v / 100.0f;
-		v = (int)(ruido_musica * 100.0f);
-		if (leer_clave(buf, "ruidomus=", &v, 0, (int)(TOPE_MUSICA * 100.0f)))
-			ruido_musica = (float)v / 100.0f;
-	}
+	// El estilo de nota SI es del jugador (se elige en las opciones), asi que
+	// vive aqui. El temblor NO: es fijo en el codigo. Un perfil viejo puede
+	// traer todavia sus claves "ruido=" y "ruidomus="; se ignoran solas, que
+	// para eso el formato deja pasar las claves que no conoce.
+	leer_clave(buf, "estilo=", &estilo_nota, 0, 1);
 
 	config_existe = 1;
 	snprintf(config_estado, sizeof(config_estado),
@@ -2273,10 +2267,8 @@ static int guardar_config(void)
 	}
 	// Una clave por linea: asi se le pueden añadir cosas sin tocar al que lee,
 	// y se puede arreglar a mano desde el PC.
-	snprintf(buf, sizeof(buf),
-	         "offset=%d\nmusica=%d\nsonido=%d\nestilo=%d\nruido=%d\nruidomus=%d\n",
-	         offset_ms, vol_musica, vol_sonido, estilo_nota,
-	         (int)(ruido_base * 100.0f), (int)(ruido_musica * 100.0f));
+	snprintf(buf, sizeof(buf), "offset=%d\nmusica=%d\nsonido=%d\nestilo=%d\n",
+	         offset_ms, vol_musica, vol_sonido, estilo_nota);
 	largo = strlen(buf);
 	if (fwrite(buf, 1, largo, f) != largo) {
 		fclose(f);
@@ -2815,7 +2807,7 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 			combo_suave += (meta - combo_suave) * 0.15f;
 		}
 
-		amp_temblor = ruido_base + ruido_musica * energia_suave *
+		amp_temblor = RUIDO_BASE_PX + RUIDO_MUSICA_PX * energia_suave *
 		              (1.0f + (GOGO_TEMBLOR  - 1.0f) * gogo_suave) *
 		              (1.0f + (COMBO_TEMBLOR - 1.0f) * combo_suave);
 
