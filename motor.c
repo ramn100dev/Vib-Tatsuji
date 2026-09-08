@@ -95,6 +95,7 @@
 #include <gs_psm.h>
 #include <dma.h>
 #include <graph.h>
+#include <gs_privileged.h>
 #include <draw.h>
 #include <draw3d.h>
 #include <font.h>
@@ -275,6 +276,91 @@ static const int ventanas_duras[3]   = {  25,    75,   108 };  // Dificil, Oni, 
 // ventanas de notas contiguas no se pisan.
 #define VENTANA_CAPTURA_MS 200
 
+//---------------------------------------------------------------------
+// El estilo: lineas con temblor
+//---------------------------------------------------------------------
+// Sale de Vib-Ribbon: lineas finas, curvas facetadas a proposito y figuras
+// de pocos tramos rectos. Lo que NO se hereda solo es el temblor.
+//
+// En PS1 las lineas vibran porque su rasterizador solo acepta coordenadas de
+// vertice ENTERAS: los vertices se pegan a la rejilla de pixeles y saltan de
+// uno a otro al moverse. Es un defecto del hardware, no un efecto buscado.
+// El GS de PS2 tiene precision sub-pixel, asi que aqui las lineas salen
+// perfectas y por eso parecerian MENOS Vib-Ribbon. Hay que ponerlo a mano, y
+// puestos a ponerlo se elige su caracter: ruido CONTINUO (la linea respira)
+// en vez de ruido blanco (que zumba y cansa la vista).
+#define RUIDO_N          64
+#define RUIDO_MASCARA    (RUIDO_N - 1)
+// 180 ms entre valores: unas cinco ondulaciones por segundo.
+#define RUIDO_PERIODO_MS 180.0f
+// Valores de partida, en pixeles. Se guardan en el pen y se tocan en plena
+// cancion con SELECT y L2/R2.
+#define RUIDO_BASE_PX    1.2f
+#define RUIDO_MUSICA_PX  0.6f
+#define PASO_BASE        0.1f
+#define PASO_MUSICA      0.1f
+
+// Cuanto se multiplica lo que aporta la musica dentro del Gogo Time.
+//
+// El Gogo lo marca el autor de la chart con #GOGOSTART: es el estribillo, la
+// parte gorda. Eso es MUCHO mas fiable que intentar deducir del audio donde
+// esta lo importante, porque viene dicho a mano. Hasta ahora solo pintaba el
+// juez de naranja; ahora ademas agita las lineas.
+#define GOGO_TEMBLOR     1.8f
+
+// Y cuanto lo multiplica el combo. Sube a escalones de 10 y llega al tope a
+// los 50, asi que se nota el hito: cada diez notas seguidas las lineas se
+// agitan un poco mas, y a las cinco tandas ya esta al maximo.
+//
+// Los dos multiplicadores se MULTIPLICAN entre si, no se suman: con 0.3 de
+// base y 0.3 de musica eso deja el fondo tranquilo en ~0.45 px, el estribillo
+// en ~0.6 y el estribillo con el combo a tope en ~0.8, que es justo donde
+// deja de parecer un efecto y empieza a parecer un fallo.
+#define COMBO_TEMBLOR    1.6f
+#define COMBO_TOPE       50
+#define TOPE_BASE        6.0f
+#define TOPE_MUSICA      3.0f
+
+// Como se dibuja una nota. El disco se lee mejor con las notas viniendo
+// rapido; el anillo es mas fiel al estilo. Se elige en las opciones.
+#define ESTILO_DISCO   0
+#define ESTILO_ANILLO  1
+
+// Facetada a proposito, como los aros de Vib-Ribbon.
+#define LADOS_NOTA        14
+#define GROSOR_ANILLO     7.0f
+#define RADIO_JUEZ_INT    22.0f
+#define RADIOS_JUEZ        8
+// Ancho de cada diente del zigzag del alma.
+//
+// 26 y no 7: con el diente estrecho salia un peine de noventa puntas y se
+// leia como una masa, no como una linea. Anchos hay sitio para ver cada
+// tramo, que es de lo que se trata.
+//
+// La segunda hebra NO lleva un paso propio ni un desfase fijo: sus vertices
+// van en los PUNTOS MEDIOS de los tramos de la primera, con el signo opuesto.
+//
+// Se probo antes con paso distinto (x1,35) y con desfase fijo, y las dos
+// fallaban por lo mismo: como los anchos son aleatorios, las dos ondas
+// derivan por su cuenta y cada cierto tramo acaban casi en fase, pegadas una
+// encima de otra durante varios dientes. Buscar el desfase "bueno" era
+// buscar suerte.
+//
+// Con los puntos medios no hay suerte que valga: entre dos vertices de una,
+// la otra tiene uno justo en medio y con el signo contrario, asi que se
+// cortan SIEMPRE, y sus vertices no pueden coincidir en x (estan a media
+// distancia por construccion), que es lo que evitaba los rombos.
+#define DIENTE_ALMA       26.0f
+
+// Alto y sitio de la onda del alma: DEBAJO del carril de notas, como en la
+// plantilla. El carril va de Y_CARRIL+57 a Y_CARRIL-57 (117 a 3).
+#define ALMA_Y           -18.0f
+#define ALMA_AMP          13.0f
+// Las reglas del carril y el alma sangran hasta el borde a proposito: son
+// lineas horizontales y lo que se pierda por los lados no es informacion.
+// Lo que se LEE se queda dentro de SEG_X.
+#define SANGRE_X         320.0f
+
 
 #define BPM_CHART       140.0f
 #define PULSO_INICIAL      4      // deja entrada antes de la primera nota
@@ -448,6 +534,15 @@ static int offset_ms = OFFSET_LATENCIA_MS;
 static int vol_musica = VOL_PASOS;
 static int vol_sonido = VOL_PASOS;
 
+// Estilo de dibujo. Vive en el fichero de ajustes del pen como todo lo demas.
+static int estilo_nota  = ESTILO_DISCO;
+static float ruido_base   = RUIDO_BASE_PX;
+static float ruido_musica = RUIDO_MUSICA_PX;
+// Amplitud que sale de verdad ahora mismo: base + musica * energia. La
+// calcula el bucle de dibujo en cada fotograma y la usan las primitivas.
+static float amp_temblor  = RUIDO_BASE_PX;
+static float ruido_tabla[RUIDO_N];
+
 // Canales de voz del SPU2 que maneja audsrv. Los golpes salen con ch = -1 (el
 // primero que este libre), asi que no hay un canal fijo al que ponerle el
 // volumen: hay que ponerselo a todos.
@@ -572,6 +667,12 @@ static int            hilo_audio_id = -1;
 // se acuerde de tapar.
 static volatile int       reloj_congelado = 0;
 static volatile long long reloj_ms_pausa  = 0;
+
+// Energia de la musica, 0..1000. La saca el hilo de audio del PCM que acaba
+// de decodificar (esta ahi mismo, no cuesta nada) y la lee el dibujo para
+// mover el temblor. Una sola palabra de 32 bits: en el R5900 esa carga no se
+// parte, asi que no hace falta seqlock como en el reloj.
+static volatile int   energia         = 0;
 
 static volatile int   audio_freq      = 44100;
 static volatile int   audio_canales   = 2;
@@ -745,7 +846,9 @@ static int hilo_audio(void *arg)
 {
 	static fuente_t      fuente;
 	static OggVorbis_File vf;
-	static char          pcm[TROZO_PCM];
+	// Alineado a 16: el calculo de energia lo recorre como muestras de 16
+	// bits, y de paso es lo que quiere el DMA que se lo lleva al IOP.
+	static char          pcm[TROZO_PCM] __attribute__((aligned(16)));
 	vorbis_info *info;
 	audsrv_fmt_t fmt;
 	int ret, bitstream, i;
@@ -929,6 +1032,34 @@ static int hilo_audio(void *arg)
 		audsrv_wait_audio((int)leido);
 		audsrv_play_audio(pcm, (int)leido);
 		enviados += leido;
+
+		// Energia del trozo, para el temblor de las lineas. Se mira una
+		// muestra de cada ocho: para mover un temblor da de sobra y deja el
+		// coste en nada.
+		{
+			short *m = (short *)pcm;
+			int n = (int)leido / 2, k, cuenta = 0;
+			long suma = 0;
+
+			for (k = 0; k < n; k += 8) {
+				int v = m[k];
+				suma += (v < 0) ? -v : v;
+				cuenta++;
+			}
+			if (cuenta > 0) {
+				// El divisor decide cuanto RECORRIDO tiene la medida, y ahi
+				// estaba el problema: con 6000, un tema masterizado moderno
+				// (que va comprimido y por tanto plano de volumen) se pasa la
+				// cancion entera pegado al tope. Saturado no varia, y si no
+				// varia el temblor tampoco.
+				//
+				// Con 12000 casi nunca llega al tope, asi que usa el rango de
+				// verdad y la diferencia entre lo flojo y lo fuerte se nota.
+				int e = (int)(suma / cuenta) * 1000 / 12000;
+				if (e > 1000) e = 1000;
+				energia = e;
+			}
+		}
 
 		// Reloj: lo que hemos mandado menos lo que aun no ha sonado.
 		//
@@ -1268,6 +1399,12 @@ static void init_drawing_environment(framebuffer_t *frame, zbuffer_t *z)
 	packet_free(packet);
 }
 
+// Circulo perfecto, sin temblor. Ya no lo usa nadie: las notas, el globo y
+// las tapas del rodillo pasaron a vertices_disco/relleno, que tiemblan. Se
+// queda por si hay que volver atras, y marcada para que no salte el aviso de
+// funcion sin usar en cada compilacion (un aviso que siempre esta acaba
+// tapando a uno que si importa).
+__attribute__((unused))
 static qword_t *build_circle(qword_t *q, float cx, float cy, float radius,
                              color_t color, int segments, int type)
 {
@@ -1516,6 +1653,415 @@ static int cargar_krom_kanji(fontx_t *f, int wmargin, int hmargin, int bold)
 	return 0;
 }
 
+//---------------------------------------------------------------------
+// Lineas con temblor
+//---------------------------------------------------------------------
+static void iniciar_ruido(void)
+{
+	int i;
+	// Semilla fija a proposito: si algo se ve raro, se ve raro IGUAL en cada
+	// arranque y se puede perseguir.
+	srand(1234);
+	for (i = 0; i < RUIDO_N; i++)
+		ruido_tabla[i] = (float)rand() / (float)RAND_MAX * 2.0f - 1.0f;
+}
+
+// Ruido continuo: interpola entre dos valores de la tabla con una curva
+// suave (3t^2-2t^3), que es lo que evita los escalones.
+static float ruido(int semilla, float t)
+{
+	int i = (int)t;
+	float f = t - (float)i;
+	float a = ruido_tabla[(semilla + i) & RUIDO_MASCARA];
+	float b = ruido_tabla[(semilla + i + 1) & RUIDO_MASCARA];
+
+	f = f * f * (3.0f - 2.0f * f);
+	return a + (b - a) * f;
+}
+
+// Reloj del temblor: se muestrea UNA VEZ POR FOTOGRAMA ENTERO, no por vsync.
+//
+// En modo entrelazado cada vsync es un CAMPO, o sea medio fotograma. Si el
+// ruido cambia en cada vsync, los dos campos de un mismo fotograma llevan
+// geometria DISTINTA, y entonces:
+//
+//   - en un emulador que mezcla campos (PCSX2 con desentrelazado automatico)
+//     cada trazo sale con una copia tenue desplazada: la figura "doble"
+//   - en un tubo de verdad los campos no se mezclan, se alternan a 50 Hz, y
+//     se ve como un parpadeo del contorno
+//
+// Comprobado en PCSX2 con dos ISOs identicas salvo el temblor: con el temblor
+// a cero los trazos salen limpios, con temblor por campo salen dobles, y
+// muestreando por fotograma vuelven a salir limpios con el temblor vivo.
+//
+// El bit 13 del CSR del GS dice que campo se esta mostrando (0 par, 1 impar).
+// Se toma la muestra al entrar en el par y se reutiliza en el impar, asi que
+// el temblor se refresca a 25 Hz: para un ruido de periodo 180 ms sobra.
+//
+// El tiempo se ACUMULA en vez de leer cpu_ticks a pelo porque ese contador es
+// de 32 bits y da la vuelta cada ~14,5 s; la resta sin signo sale bien aunque
+// haya dado la vuelta mientras el intervalo sea corto, que es el mismo truco
+// que usa el reloj de cancion.
+static float reloj_temblor(void)
+{
+	static unsigned int ticks_prev = 0;
+	static float ms = 0.0f;
+	static float t_fijo = -1.0f;
+	static int campo_prev = -1;
+	unsigned int ahora_t = cpu_ticks();
+	int campo;
+
+	if (ticks_prev != 0)
+		ms += (float)(unsigned int)(ahora_t - ticks_prev)
+		      * 1000.0f / (float)TICKS_POR_SEG;
+	ticks_prev = ahora_t;
+
+	campo = (int)((*GS_REG_CSR >> 13) & 1);
+	if (t_fijo < 0.0f || (campo == 0 && campo != campo_prev))
+		t_fijo = ms / RUIDO_PERIODO_MS;
+	campo_prev = campo;
+
+	return t_fijo;
+}
+
+// Una polilinea con los vertices temblando: la primitiva de la que sale todo
+// lo demas. Cada vertice coge su propia semilla, asi que se mueven
+// desacompasados y la figura parece trazada a mano en vez de sacudida.
+static qword_t *poli(qword_t *q, const float *px, const float *py, int n,
+                     int cerrada, color_t color, int semilla, float t)
+{
+	// 160 y no 64: la onda del alma pasa de noventa puntos con el diente a 15
+	// grados, y como ahora el ancho varia, en el peor caso (todos estrechos)
+	// se acerca a 130. Son 160*(16+8) = ~4 KB de pila, que sobra.
+	vertex_f_t puntos[160];
+	xyz_t verts[160];
+	float escala = 1.0f / 2048.0f;
+	prim_t prim;
+	int i, total;
+
+	if (n < 2) return q;
+	if (n > 158) n = 158;
+	total = cerrada ? n + 1 : n;
+
+	for (i = 0; i < n; i++) {
+		float dx = ruido(semilla + i * 2,     t) * amp_temblor;
+		float dy = ruido(semilla + i * 2 + 1, t) * amp_temblor;
+
+		puntos[i].x = (px[i] + dx) * escala;
+		puntos[i].y = (py[i] + dy) * escala;
+		puntos[i].z = 0.0f;
+		puntos[i].w = 1.0f;
+	}
+	if (cerrada) puntos[n] = puntos[0];
+
+	draw_convert_xyz(verts, 2048, 2048, 32, total, puntos);
+
+	prim.type         = PRIM_LINE_STRIP;
+	prim.shading      = PRIM_SHADE_FLAT;
+	prim.mapping      = DRAW_DISABLE;
+	prim.fogging      = DRAW_DISABLE;
+	prim.blending     = DRAW_DISABLE;
+	prim.antialiasing = DRAW_ENABLE;
+	prim.mapping_type = PRIM_MAP_ST;
+	prim.colorfix     = PRIM_UNFIXED;
+
+	q = draw_prim_start(q, 0, &prim, &color);
+	for (i = 0; i < total; i++) {
+		q->dw[0] = color.rgbaq;
+		q->dw[1] = verts[i].xyz;
+		q++;
+	}
+	// draw_prim_end cierra el GIFtag y cuadra el paquete. Sin esto no sale un
+	// dibujo torcido: sale basura o un cuelgue.
+	return draw_prim_end(q, 2, DRAW_RGBAQ_REGLIST);
+}
+
+static qword_t *aro(qword_t *q, float cx, float cy, float r, int lados,
+                    color_t color, int semilla, float t)
+{
+	float px[64], py[64];
+	int i;
+
+	if (lados > 60) lados = 60;
+	for (i = 0; i < lados; i++) {
+		float a = (float)i * (2.0f * (float)M_PI) / (float)lados;
+		px[i] = cx + r * cosf(a);
+		py[i] = cy + r * sinf(a);
+	}
+	return poli(q, px, py, lados, 1, color, semilla, t);
+}
+
+static qword_t *linea(qword_t *q, float x0, float y0, float x1, float y1,
+                      color_t color, int semilla, float t)
+{
+	float px[2], py[2];
+	px[0] = x0; py[0] = y0;
+	px[1] = x1; py[1] = y1;
+	return poli(q, px, py, 2, 0, color, semilla, t);
+}
+
+// Vertices de un poligono que tiembla Y GIRA despacio.
+//
+// El problema de poner el ruido solo en el contorno es que se ve poco, y al
+// subirlo el aro se despega del relleno y se vuelve loco por su cuenta. Con
+// esto tiembla la figura ENTERA: el relleno y su contorno salen de los mismos
+// vertices, asi que no se pueden desincronizar por mucho que se suba.
+//
+// Y encima gira un poco. Un poligono de 14 lados es casi un circulo y el
+// temblor solo se nota en el borde; girandolo despacio se mueven las facetas,
+// que es lo que hace que no parezca un sello estampado.
+static int vertices_disco(float *px, float *py, float cx, float cy, float r,
+                          int lados, int semilla, float t)
+{
+	// Giro lento y corto: la faceta de un poligono de 14 lados mide 25 grados,
+	// asi que con +-0,2 rad (11 grados) se mueve casi media faceta. Mas seria
+	// verlo girar, y esto no gira: tiembla.
+	float giro = ruido(semilla + 500, t * 0.35f) * 0.2f;
+	int i;
+
+	if (lados > 60) lados = 60;
+	for (i = 0; i < lados; i++) {
+		float a = giro + (float)i * (2.0f * (float)M_PI) / (float)lados;
+		float rr = r + ruido(semilla + i, t) * amp_temblor;
+
+		px[i] = cx + rr * cosf(a);
+		py[i] = cy + rr * sinf(a);
+	}
+	return lados;
+}
+
+// Relleno a partir de vertices YA calculados: no les anade ruido, porque ya
+// lo traen. Es lo que evita el doble temblor.
+static qword_t *relleno(qword_t *q, const float *px, const float *py, int n,
+                        float cx, float cy, color_t color)
+{
+	vertex_f_t puntos[66];
+	xyz_t verts[66];
+	float escala = 1.0f / 2048.0f;
+	prim_t prim;
+	int i;
+
+	if (n < 3) return q;
+	if (n > 60) n = 60;
+
+	puntos[0].x = cx * escala;
+	puntos[0].y = cy * escala;
+	puntos[0].z = 0.0f;
+	puntos[0].w = 1.0f;
+	for (i = 0; i < n; i++) {
+		puntos[i + 1].x = px[i] * escala;
+		puntos[i + 1].y = py[i] * escala;
+		puntos[i + 1].z = 0.0f;
+		puntos[i + 1].w = 1.0f;
+	}
+	puntos[n + 1] = puntos[1];   // cierra el abanico
+
+	draw_convert_xyz(verts, 2048, 2048, 32, n + 2, puntos);
+
+	prim.type         = PRIM_TRIANGLE_FAN;
+	prim.shading      = PRIM_SHADE_FLAT;
+	prim.mapping      = DRAW_DISABLE;
+	prim.fogging      = DRAW_DISABLE;
+	prim.blending     = DRAW_DISABLE;
+	prim.antialiasing = DRAW_ENABLE;
+	prim.mapping_type = PRIM_MAP_ST;
+	prim.colorfix     = PRIM_UNFIXED;
+
+	q = draw_prim_start(q, 0, &prim, &color);
+	for (i = 0; i < n + 2; i++) {
+		q->dw[0] = color.rgbaq;
+		q->dw[1] = verts[i].xyz;
+		q++;
+	}
+	return draw_prim_end(q, 2, DRAW_RGBAQ_REGLIST);
+}
+
+// Contorno a partir de vertices ya calculados, por lo mismo.
+static qword_t *trazo(qword_t *q, const float *px, const float *py, int n,
+                      color_t color)
+{
+	vertex_f_t puntos[66];
+	xyz_t verts[66];
+	float escala = 1.0f / 2048.0f;
+	prim_t prim;
+	int i;
+
+	if (n < 2) return q;
+	if (n > 64) n = 64;
+
+	for (i = 0; i < n; i++) {
+		puntos[i].x = px[i] * escala;
+		puntos[i].y = py[i] * escala;
+		puntos[i].z = 0.0f;
+		puntos[i].w = 1.0f;
+	}
+	puntos[n] = puntos[0];
+
+	draw_convert_xyz(verts, 2048, 2048, 32, n + 1, puntos);
+
+	prim.type         = PRIM_LINE_STRIP;
+	prim.shading      = PRIM_SHADE_FLAT;
+	prim.mapping      = DRAW_DISABLE;
+	prim.fogging      = DRAW_DISABLE;
+	prim.blending     = DRAW_DISABLE;
+	prim.antialiasing = DRAW_ENABLE;
+	prim.mapping_type = PRIM_MAP_ST;
+	prim.colorfix     = PRIM_UNFIXED;
+
+	q = draw_prim_start(q, 0, &prim, &color);
+	for (i = 0; i < n + 1; i++) {
+		q->dw[0] = color.rgbaq;
+		q->dw[1] = verts[i].xyz;
+		q++;
+	}
+	return draw_prim_end(q, 2, DRAW_RGBAQ_REGLIST);
+}
+
+// Lineas verticales cayendo: el aviso de nota mala.
+//
+// Es lo contrario del destello a proposito. El destello sale del centro hacia
+// TODOS lados y celebra; esto son trazos verticales que se descuelgan hacia
+// abajo y se apagan. Misma gramatica (solo lineas rectas), lectura opuesta:
+// no hay que mirar el color para saber que ha ido mal.
+static qword_t *desanimo(qword_t *q, float x, float y, float prog, color_t c,
+                         int semilla, float t)
+{
+	float caida = 26.0f * prog;             // se van escurriendo hacia abajo
+	float largo = 30.0f * (1.0f - prog);    // y encogiendo hasta desaparecer
+	int i;
+
+	if (largo < 1.0f) return q;
+
+	// Cuelgan de la PARTE DE ARRIBA del juez. El aro tiene 34 de radio: a 70
+	// quedaban despegadas por completo y a 20 caian en el centro tapando la
+	// nota. Naciendo a 44 asoman justo por encima del borde y bajan sobre el.
+	for (i = 0; i < 5; i++) {
+		float dx = (float)(i - 2) * 13.0f;
+		float y0 = y + 44.0f - caida;
+
+		q = linea(q, x + dx, y0, x + dx, y0 - largo, c, semilla + i * 5, t);
+	}
+	return q;
+}
+
+// Trazos rectos saliendo hacia fuera: la unica forma de "efecto" que admite
+// este estilo. Sin particulas, sin destellos redondos, solo lineas.
+//
+// prog va de 0 (recien golpeado) a 1 (se acabo): los rayos se alejan del
+// centro y se acortan, asi que el destello se abre y se apaga solo.
+// Alto de cada diente de la onda del alma. Sale de la tabla del ruido y es
+// FIJO por diente (no depende del tiempo): asi la onda tiene una silueta
+// irregular y estable, como un sismografo, y lo que se mueve encima es el
+// temblor de poli(). Con todos los dientes iguales parecia lo que era, una
+// onda triangular generada, y cantaba.
+static float alto_diente(int k)
+{
+	float v = ruido_tabla[(k * 7) & RUIDO_MASCARA];
+
+	if (v < 0.0f) v = -v;
+	// Practicamente el maximo, bajando unos pocos pixeles. La variacion esta
+	// para que no parezca generado, no para que la onda se encoja: con el
+	// suelo bajo se desinflaba y perdia la sensacion de barra.
+	return ALMA_AMP * (0.86f + 0.14f * v);
+}
+
+// Ancho de cada diente, tambien irregular.
+//
+// Esto es lo que rompe los rombos: con el ancho fijo, las dos hebras ponian
+// sus vertices en las MISMAS x y al cruzarse dibujaban una reja de rombos
+// perfectos, que es justo lo contrario de lo que se busca. Con el ancho
+// variando por diente y por hebra, cada una lleva su propio paso, los
+// vertices no coinciden nunca y los cruces caen donde toque.
+//
+// Y como el angulo de un diente sale de su alto y su ancho, variar los dos
+// significa que no hay dos angulos iguales en toda la onda.
+static float ancho_diente(int k, int semilla)
+{
+	float v = ruido_tabla[(k * 13 + 5 + semilla) & RUIDO_MASCARA];
+
+	if (v < 0.0f) v = -v;
+	return DIENTE_ALMA * (0.72f + 0.56f * v);
+}
+
+// Dibuja una onda del alma a partir de una lista de x, alternando arriba y
+// abajo, cortada exactamente donde llega el alma.
+//
+// La punta va INTERPOLADA hasta ese corte. Antes se clavaba en el centro de
+// la banda y por eso el avance parecia a saltos: la linea se quedaba quieta
+// mientras crecia el trozo que faltaba para el vertice siguiente, y al llegar
+// aparecia el pico entero de golpe.
+static qword_t *onda_alma(qword_t *q, const float *xs, int nxs, int invertida,
+                          int desp, float fin_x, color_t c, int semilla,
+                          float t)
+{
+	float px[160], py[160];
+	int n = 0, i;
+
+	for (i = 0; i < nxs && n < 158; i++) {
+		float h = alto_diente(i + desp);
+
+		if (xs[i] > fin_x) break;
+		px[n] = xs[i];
+		py[n] = ALMA_Y + (((i & 1) ^ invertida) ? -h : h);
+		n++;
+	}
+
+	if (n >= 1 && i < nxs && fin_x > px[n - 1] && n < 159) {
+		float h  = alto_diente(i + desp);
+		float yb = ALMA_Y + (((i & 1) ^ invertida) ? -h : h);
+		float xa = px[n - 1], ya = py[n - 1], xb = xs[i];
+		float f  = (xb > xa) ? (fin_x - xa) / (xb - xa) : 0.0f;
+
+		px[n] = fin_x;
+		py[n] = ya + (yb - ya) * f;
+		n++;
+	}
+
+	if (n >= 2) return poli(q, px, py, n, 0, c, semilla, t);
+	return q;
+}
+
+static qword_t *destello(qword_t *q, float x, float y, int rayos,
+                         float prog, color_t c, int semilla, float t)
+{
+	float dentro = 14.0f + 30.0f * prog;
+	float largo  = 20.0f * (1.0f - prog);
+	int i;
+
+	if (largo < 1.0f) return q;
+
+	for (i = 0; i < rayos; i++) {
+		float a = (float)i * (2.0f * (float)M_PI) / (float)rayos;
+		float ca = cosf(a), sa = sinf(a);
+		q = linea(q, x + dentro * ca, y + dentro * sa,
+		          x + (dentro + largo) * ca, y + (dentro + largo) * sa,
+		          c, semilla + i * 3, t);
+	}
+	return q;
+}
+
+// Ancho aproximado de una cadena, para poder centrarla. Un caracter de dos
+// bytes de Shift-JIS ocupa el doble que uno ASCII, asi que contar bytes no
+// vale: un titulo japones saldria descentrado justo el doble de lo que mide.
+#define ANCHO_CAR  8.4f
+
+static float ancho_texto(const char *s)
+{
+	const unsigned char *p = (const unsigned char *)s;
+	float w = 0.0f;
+
+	while (*p) {
+		if (((*p >= 0x81 && *p <= 0x9F) || (*p >= 0xE0 && *p <= 0xFC)) && p[1]) {
+			w += ANCHO_CAR * 2.0f;
+			p += 2;
+		} else {
+			w += ANCHO_CAR;
+			p++;
+		}
+	}
+	return w;
+}
+
 static qword_t *texto(qword_t *q, float x, float y, const char *s, color_t c)
 {
 	vertex_t v0;
@@ -1534,6 +2080,27 @@ static qword_t *texto(qword_t *q, float x, float y, const char *s, color_t c)
 
 	return fontx_print_ascii(q, 0, (const unsigned char *)s,
 	                         LEFT_ALIGN, &v0, &c, &krom);
+}
+
+static qword_t *texto_centrado(qword_t *q, float y, const char *s, color_t c)
+{
+	return texto(q, -ancho_texto(s) * 0.5f, y, s, c);
+}
+
+// Centrado sobre una x cualquiera, no sobre el medio de la pantalla.
+static qword_t *texto_centrado_en(qword_t *q, float cx, float y,
+                                  const char *s, color_t c)
+{
+	return texto(q, cx - ancho_texto(s) * 0.5f, y, s, c);
+}
+
+// Pegado por la derecha a una x. Hace falta para que una columna de numeros
+// quede cuadrada: alineados por la izquierda, "50" y "400" no empiezan en el
+// mismo sitio y la columna baila.
+static qword_t *texto_derecha(qword_t *q, float x_fin, float y,
+                              const char *s, color_t c)
+{
+	return texto(q, x_fin - ancho_texto(s), y, s, c);
 }
 
 //---------------------------------------------------------------------
@@ -1664,6 +2231,21 @@ static void cargar_config(void)
 	leer_clave(buf, "musica=", &vol_musica, 0, VOL_PASOS);
 	leer_clave(buf, "sonido=", &vol_sonido, 0, VOL_PASOS);
 
+	// El estilo y el temblor. En centesimas de pixel porque el fichero es de
+	// enteros; las claves que no esten se quedan como estaban, asi que un
+	// perfil viejo sigue valiendo y estos salen con su valor de fabrica.
+	{
+		int v;
+
+		leer_clave(buf, "estilo=", &estilo_nota, 0, 1);
+		v = (int)(ruido_base * 100.0f);
+		if (leer_clave(buf, "ruido=", &v, 0, (int)(TOPE_BASE * 100.0f)))
+			ruido_base = (float)v / 100.0f;
+		v = (int)(ruido_musica * 100.0f);
+		if (leer_clave(buf, "ruidomus=", &v, 0, (int)(TOPE_MUSICA * 100.0f)))
+			ruido_musica = (float)v / 100.0f;
+	}
+
 	config_existe = 1;
 	snprintf(config_estado, sizeof(config_estado),
 	         "leidos del pen");
@@ -1691,8 +2273,10 @@ static int guardar_config(void)
 	}
 	// Una clave por linea: asi se le pueden añadir cosas sin tocar al que lee,
 	// y se puede arreglar a mano desde el PC.
-	snprintf(buf, sizeof(buf), "offset=%d\nmusica=%d\nsonido=%d\n",
-	         offset_ms, vol_musica, vol_sonido);
+	snprintf(buf, sizeof(buf),
+	         "offset=%d\nmusica=%d\nsonido=%d\nestilo=%d\nruido=%d\nruidomus=%d\n",
+	         offset_ms, vol_musica, vol_sonido, estilo_nota,
+	         (int)(ruido_base * 100.0f), (int)(ruido_musica * 100.0f));
 	largo = strlen(buf);
 	if (fwrite(buf, 1, largo, f) != largo) {
 		fclose(f);
@@ -2024,7 +2608,10 @@ static void informe_calibracion(void)
 
 // Resuelve un golpe del tipo pedido. Devuelve el juicio, o JUICIO_NADA si el
 // golpe fue al vacio (que suena pero no cuenta ni como fallo).
-static int juzgar(int tipo, int ahora, int *perfectos, int *buenos, int *fallos)
+// El ultimo parametro es "malos", no "fallos": aqui solo se cuenta el 不可 de
+// haber golpeado FUERA de tiempo. Las notas que pasan de largo sin tocarlas
+// las cuenta el bucle de juego, en su propio contador.
+static int juzgar(int tipo, int ahora, int *perfectos, int *buenos, int *malos)
 {
 	int idx = nota_mas_cercana(tipo, ahora);
 	int dif;
@@ -2065,7 +2652,7 @@ static int juzgar(int tipo, int ahora, int *perfectos, int *buenos, int *fallos)
 
 	// 不可: la nota se ha enganchado pero tarde (o pronto) de mas. Se come la
 	// nota igual y rompe el combo. No suena nada, como cualquier otro fallo.
-	(*fallos)++;
+	(*malos)++;
 	return JUICIO_FALLO;
 }
 
@@ -2097,7 +2684,12 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 	unsigned short prev_btns = 0x0000;
 	int ultimo_juicio = JUICIO_NADA;
 	int juicio_hasta_ms = 0;
-	int perfectos = 0, buenos = 0, fallos = 0;
+	// Los dos motivos de perder una nota, por separado. Los dos son 不可 en el
+	// taiko de verdad, pero mientras practicas no dicen lo mismo: uno es
+	// "llegaste tarde" y el otro "ni la viste".
+	int perfectos = 0, buenos = 0;
+	int malos = 0;      // golpeadas fuera de la ventana buena
+	int perdidas = 0;   // pasaron de largo sin tocarlas
 	int combo = 0, combo_max = 0;
 	int rodillo_golpes = 0;
 	int globos_rotos = 0, globos_total = 0;
@@ -2107,7 +2699,6 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 	int frames_fin = 0;   // fotogramas que lleva puesta la pantalla de resultados
 	int puntos = 0;       // shin'uchi: la partitura entera vale un millon
 	int puntos_nota = 0;  // lo que vale una nota clavada
-	int record = 0;       // 1 si esta partida ha batido la marca guardada
 	float alma = 0.0f;    // 0..100; al final decide si se aprueba
 	float alma_ok = 0.0f, alma_bien = 0.0f, alma_mal = 0.0f;
 	int   alma_norma = 60;
@@ -2117,6 +2708,13 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 	int siguiente_log_frames = 1000;
 #endif
 	int siguiente_nota = 0;   // primera nota sin pasar, para no recorrer todo
+	int fin_chart_ms = 0;
+	// Reloj del temblor y suavizado de la energia de la musica.
+	float energia_suave = 0.0f;
+	float gogo_suave = 0.0f;
+	float combo_suave = 0.0f;
+	// Cuando reviento un globo, para el destello.
+	int globo_roto_hasta = 0;
 #if AUTOCICLO
 	int frames_auto = 0;
 #endif
@@ -2167,15 +2765,59 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 		    juzgables, nivel, alma_ok, alma_bien, alma_mal, alma_norma);
 	}
 
+	// Donde acaba la chart. Se mira fin_ms y no tiempo_ms: un rodillo de dos
+	// segundos acaba mucho despues de donde empieza.
+	{
+		int k;
+		for (k = 0; k < n_notas; k++)
+			if (notas[k].fin_ms > fin_chart_ms) fin_chart_ms = notas[k].fin_ms;
+	}
+
 	dma_wait_fast();
 
 	for (;;) {
 		struct padButtonStatus buttons;
 		int ahora, i, don_pulsado, ka_pulsado;
+		float t_ruido;
+		int dibujadas = 0;
 		unsigned short btns;
 
 		current = packets[context];
 		ahora = leer_reloj_ms();
+
+		// Tiempo REAL y no tiempo de cancion: el temblor tiene que seguir
+		// vivo con el reloj parado (en la pausa, o antes de empezar), o las
+		// lineas se congelarian y cantaria.
+		t_ruido = reloj_temblor();
+
+		// La energia se suaviza: en crudo pega saltos por trozo y el temblor
+		// daria tirones en vez de acompanar.
+		energia_suave += ((float)energia / 1000.0f - energia_suave) * 0.12f;
+
+		// Y el Gogo tambien se suaviza, por lo mismo: entrar y salir de golpe
+		// del estribillo daria un salto de golpe en las lineas. Con esto la
+		// agitacion sube y baja en algo menos de medio segundo.
+		{
+			float meta = (siguiente_nota < n_notas &&
+			              notas[siguiente_nota].gogo) ? 1.0f : 0.0f;
+			gogo_suave += (meta - gogo_suave) * 0.06f;
+		}
+
+		// El combo, a escalones de diez. Suavizado como los otros dos: el
+		// escalon se nota igual, pero entra en un cuarto de segundo en vez de
+		// aparecer de golpe en un fotograma.
+		{
+			int pasos = combo / 10;
+			float meta;
+
+			if (pasos > COMBO_TOPE / 10) pasos = COMBO_TOPE / 10;
+			meta = (float)pasos / (float)(COMBO_TOPE / 10);
+			combo_suave += (meta - combo_suave) * 0.15f;
+		}
+
+		amp_temblor = ruido_base + ruido_musica * energia_suave *
+		              (1.0f + (GOGO_TEMBLOR  - 1.0f) * gogo_suave) *
+		              (1.0f + (COMBO_TEMBLOR - 1.0f) * combo_suave);
 
 		// Ritmo del bucle de dibujo: si un frame tarda mas que la ventana
 		// de acierto, hay notas que ningun frame llega a ver a tiempo.
@@ -2336,6 +2978,7 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 						notas[t].resuelta = 1;   // reventado
 						globos_rotos++;
 						sfx_pedido[SFX_BIGDON]++;
+						globo_roto_hasta = ahora + 400;
 					} else {
 						sfx_pedido[SFX_DON]++;
 					}
@@ -2355,7 +2998,7 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 		// engancha fuera de la ventana buena. Se come la nota y rompe el
 		// combo, igual que una que se pasa de largo.
 		if (don_pulsado) {
-			int j = juzgar(NOTA_DON, ahora, &perfectos, &buenos, &fallos);
+			int j = juzgar(NOTA_DON, ahora, &perfectos, &buenos, &malos);
 			if (j == JUICIO_PERFECTO || j == JUICIO_BUENO) {
 				ultimo_juicio = j; juicio_hasta_ms = ahora + 200;
 				if (++combo > combo_max) combo_max = combo;
@@ -2371,7 +3014,7 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 			}
 		}
 		if (ka_pulsado) {
-			int j = juzgar(NOTA_KA, ahora, &perfectos, &buenos, &fallos);
+			int j = juzgar(NOTA_KA, ahora, &perfectos, &buenos, &malos);
 			if (j == JUICIO_PERFECTO || j == JUICIO_BUENO) {
 				ultimo_juicio = j; juicio_hasta_ms = ahora + 200;
 				if (++combo > combo_max) combo_max = combo;
@@ -2403,7 +3046,7 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 				// Un rodillo o un globo que se pasa NO es un fallo: en taiko
 				// no rompen el combo, simplemente no suman.
 				notas[siguiente_nota].resuelta = 1;
-				fallos++;
+				perdidas++;
 				alma += alma_mal;
 				if (alma < 0.0f) alma = 0.0f;
 #if AUTOGOLPE
@@ -2411,8 +3054,10 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 				    siguiente_nota, notas[siguiente_nota].tiempo_ms,
 				    ahora, ahora - notas[siguiente_nota].tiempo_ms);
 #endif
-				ultimo_juicio = JUICIO_FALLO;
-				juicio_hasta_ms = ahora + 200;
+				// Una nota que pasa de largo NO dibuja nada. Las lineas de
+				// desanimo son para el mal GOLPE: verlas sin haber tocado
+				// dice lo contrario de lo que pasa, y ademas en un tramo
+				// perdido saldrian una detras de otra sin parar.
 				combo = 0;
 			}
 			notas[siguiente_nota].resuelta = 1;
@@ -2430,97 +3075,117 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 		q = draw_enable_tests(q, 0, z);
 
 		if (fin) {
-			// Barras proporcionales, y ahora tambien los numeros: blanco
-			// perfectos, amarillo buenos, gris fallos. Las barras se
-			// dibujan ANTES que el texto, que va siempre al final de la
-			// cadena (ver la cabecera de texto()).
-			int total = perfectos + buenos + fallos;
-			float ancho = 400.0f;
+			// Pantalla de resultados.
+			//
+			// Todo lo que se lee vive en la mitad de arriba: la de abajo se
+			// deja libre a proposito para el personaje, que tiene que poder
+			// seguir ahi al cambiar de pantalla.
+			//
+			// Las figuras van ANTES que el texto, que estampa la Z maxima y
+			// se lleva por delante lo que se mande despues (ver texto()).
+			int total = perfectos + buenos + malos + perdidas;
+			float bx0 = -SEG_X, bancho = SEG_X * 2.0f;
+			float by = 60.0f, balto = 20.0f;
+			float x = bx0;
 			char linea[80];
+
 			if (total < 1) total = 1;
 			frames_fin++;
 
-			q = build_rect(q, -120.0f,  40.0f,
-			               ancho * perfectos / total, 24.0f, blanco);
-			q = build_rect(q, -120.0f,   4.0f,
-			               ancho * buenos    / total, 24.0f, amarillo);
-			q = build_rect(q, -120.0f, -32.0f,
-			               ancho * fallos    / total, 24.0f, gris);
+			// La barra: una tira continua repartida entre los cuatro juicios.
+			// En este orden y no en otro, porque asi va de mejor a peor y se
+			// lee de un vistazo cuanto hay de cada cosa.
+			{
+				float w;
 
-			q = texto(q, -SEG_X, SEG_Y, "RESULTADOS", amarillo);
-			// Recortado a 34: a partir de ahi se meteria debajo de la
-			// puntuacion, que empieza en x=100. Con recorte_sjis y no con
-			// "%.34s", que partiria un kanji por la mitad.
-			recorte_sjis(linea, sizeof(linea), can->titulo, 34);
-			q = texto(q, -SEG_X, SEG_Y - 34.0f, linea, blanco);
-			snprintf(linea, sizeof(linea), "%s  nivel %d",
-			         nombre_curso[curso], can->nivel[curso]);
-			q = texto(q, -SEG_X, SEG_Y - 58.0f, linea, gris);
-
-			snprintf(linea, sizeof(linea), "%d PUNTOS", puntos);
-			q = texto(q, 100.0f, SEG_Y - 34.0f, linea, blanco);
-
-			// Aprobado o no: es lo unico para lo que sirve el alma, y solo
-			// se mira aqui. Durante la cancion nunca se muere.
-			if (alma >= alma_norma)
-				q = texto(q, 100.0f, SEG_Y - 90.0f, "APROBADO", amarillo);
-			else
-				q = texto(q, 100.0f, SEG_Y - 90.0f, "NO SUPERADO", gris);
-			snprintf(linea, sizeof(linea), "alma %d%% de %d%%",
-			         (int)alma, alma_norma);
-			q = texto(q, 100.0f, SEG_Y - 114.0f, linea, gris);
-			if (record) {
-				q = texto(q, 100.0f, SEG_Y - 58.0f, "NUEVO RECORD", amarillo);
-			} else if (mejor_puntos >= 0) {
-				snprintf(linea, sizeof(linea), "mejor %d", mejor_puntos);
-				q = texto(q, 100.0f, SEG_Y - 58.0f, linea, gris);
+				w = bancho * perfectos / total;
+				if (w > 0.0f) q = build_rect(q, x, by, w, balto, amarillo);
+				x += w;
+				w = bancho * buenos / total;
+				if (w > 0.0f) q = build_rect(q, x, by, w, balto, blanco);
+				x += w;
+				w = bancho * malos / total;
+				if (w > 0.0f) q = build_rect(q, x, by, w, balto, azul);
+				x += w;
+				// Las perdidas cierran la tira: lo que queda hasta el final,
+				// para que la barra llegue siempre al borde aunque las
+				// divisiones dejen algun pixel suelto por el redondeo.
+				w = (bx0 + bancho) - x;
+				if (w > 0.0f) q = build_rect(q, x, by, w, balto, gris);
 			}
 
-			snprintf(linea, sizeof(linea), "Perfectos %4d", perfectos);
-			q = texto(q, -SEG_X, 46.0f, linea, blanco);
-			snprintf(linea, sizeof(linea), "Buenos    %4d", buenos);
-			q = texto(q, -SEG_X, 10.0f, linea, amarillo);
-			snprintf(linea, sizeof(linea), "Fallos    %4d", fallos);
-			q = texto(q, -SEG_X, -26.0f, linea, gris);
+			//--- Columna izquierda ---
+			{
+				char corte[48];
 
-			snprintf(linea, sizeof(linea), "Combo maximo %d", combo_max);
-			q = texto(q, -SEG_X, -80.0f, linea, blanco);
+				recorte_sjis(corte, sizeof(corte), can->titulo, 30);
+				snprintf(linea, sizeof(linea), "%s - %s", corte,
+				         nombre_curso[curso]);
+			}
+			q = texto(q, -SEG_X, SEG_Y - 16.0f, linea, blanco);
 
-			snprintf(linea, sizeof(linea), "Rodillos %d golpes    Globos %d de %d",
-			         rodillo_golpes, globos_rotos, globos_total);
-			q = texto(q, -SEG_X, -112.0f, linea, amarillo);
+			// La puntuacion y el aprobado se centran SOBRE EL TITULO, no en
+			// una x fija. El titulo empieza pegado al margen y su largo
+			// cambia con cada cancion, asi que con una x fija los tres
+			// quedaban descuadrados en cuanto el nombre no era el de la
+			// plantilla. Midiendolo, la columna se centra sola.
+			{
+				float cx = -SEG_X + ancho_texto(linea) * 0.5f;
 
-			// Calibracion. Solo sale si la partida dio para medirla: con
-			// menos de veinte golpes enganchados el numero no vale nada, y
-			// enseñarlo invitaria a guardar una barbaridad.
-			// La calibracion SOLO sale en el metronomo. En una cancion
-			// normal se sigue midiendo (la mediana se apunta igual y sale por
-			// consola), pero enseñarla ahi era ruido: un numero que no se
-			// puede guardar desde esa pantalla, encima de unos resultados que
-			// no tienen nada que ver con el.
+				snprintf(linea, sizeof(linea), "%d", puntos);
+				q = texto_centrado_en(q, cx, SEG_Y - 54.0f, linea, blanco);
+
+				// Aprobado o no: es lo unico para lo que sirve el alma, y
+				// solo se mira aqui. Durante la cancion nunca se muere.
+				q = texto_centrado_en(q, cx, SEG_Y - 96.0f,
+				                      (alma >= alma_norma) ? "APROBADO"
+				                                           : "NO SUPERADO",
+				                      (alma >= alma_norma) ? amarillo : gris);
+			}
+
+			//--- Columna derecha: los tres juicios ---
+			//
+			// Cada uno con el color con el que se ve durante la partida: el
+			// destello del perfecto es amarillo, el del bien blanco y las
+			// lineas del mal azules. Asi la pantalla de resultados usa el
+			// mismo idioma que el juego en vez de inventarse otro.
+			q = texto_derecha(q, 205.0f, SEG_Y - 16.0f, "Perfecto", amarillo);
+			snprintf(linea, sizeof(linea), "%d", perfectos);
+			q = texto_derecha(q, SEG_X, SEG_Y - 16.0f, linea, blanco);
+
+			q = texto_derecha(q, 205.0f, SEG_Y - 54.0f, "Bien", blanco);
+			snprintf(linea, sizeof(linea), "%d", buenos);
+			q = texto_derecha(q, SEG_X, SEG_Y - 54.0f, linea, blanco);
+
+			q = texto_derecha(q, 205.0f, SEG_Y - 92.0f, "Mal", azul);
+			snprintf(linea, sizeof(linea), "%d", malos);
+			q = texto_derecha(q, SEG_X, SEG_Y - 92.0f, linea, blanco);
+
+			//--- Debajo de la barra ---
+			snprintf(linea, sizeof(linea), "Combo max: %d    Rodillos: %d",
+			         combo_max, rodillo_golpes);
+			q = texto(q, -SEG_X, 34.0f, linea, blanco);
+
+			// La calibracion se queda, pero SOLO en el metronomo y abajo del
+			// todo. No es adorno: es donde se guarda, y sin ella el metronomo
+			// no sirve para lo que existe.
 			if (modo_calibracion) {
 				if (cal_disp < 0) {
-					// Sin muestras suficientes no hay medida, y aqui hay que
-					// decirlo: si no, quien acaba de calibrar se encuentra la
-					// pantalla sin nada que guardar y sin saber por que.
 					snprintf(linea, sizeof(linea),
 					         "Calibracion: %d golpes de los 20 que hacen falta",
 					         cal_n);
-					q = texto(q, -SEG_X, -146.0f, linea, gris);
+					q = texto(q, -SEG_X, -SEG_Y + 66.0f, linea, gris);
 				} else {
 					snprintf(linea, sizeof(linea),
 					         "Calibracion medida %d ms (ahora %d, dispersion %d)",
 					         cal_mediana, offset_ms, cal_disp);
-					q = texto(q, -SEG_X, -146.0f, linea,
+					q = texto(q, -SEG_X, -SEG_Y + 66.0f, linea,
 					          (cal_disp > 40) ? gris : blanco);
 					if (cal_guardada)
-						q = texto(q, -SEG_X, -170.0f, config_estado, amarillo);
-					else if (cal_disp > 40)
-						q = texto(q, -SEG_X, -170.0f,
-						          "Muy dispersa: mejor repite (ROJO la guarda igual)",
-						          gris);
+						q = texto(q, -SEG_X, -SEG_Y + 44.0f, config_estado,
+						          amarillo);
 					else
-						q = texto(q, -SEG_X, -170.0f,
+						q = texto(q, -SEG_X, -SEG_Y + 44.0f,
 						          "ROJO guarda esta calibracion en el pen",
 						          amarillo);
 				}
@@ -2540,37 +3205,108 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 			continue;
 		}
 
-		// Barra del alma. Va con las figuras y no con el HUD porque el texto
-		// estampa la Z maxima: cualquier figura mandada despues se perderia.
+		// El alma: una LINEA en zigzag que crece hacia la derecha en vez de
+		// una barra que se rellena. Sale del mismo sitio que el resto del
+		// estilo (el obstaculo "onda" de Vib-Ribbon es exactamente esto) y
+		// dice mas que un rectangulo: se ve avanzar diente a diente.
+		//
+		// Va DEBAJO del carril, como en la plantilla, y con las figuras y no
+		// con el HUD porque el texto estampa la Z maxima: cualquier figura
+		// mandada despues se perderia.
 		{
-			float ancho = 400.0f, x0 = -140.0f, y0 = 150.0f;
-			float lleno = ancho * alma / 100.0f;
+			float x0 = -SANGRE_X, x1 = SANGRE_X;
+			float ancho = x1 - x0;
+			float fin_x = x0 + ancho * alma / 100.0f;
 			float xn = x0 + ancho * alma_norma / 100.0f;
+			float ax[160], bx[160];
+			int na = 0, nb = 0, k;
+			color_t c = (alma >= alma_norma) ? amarillo : naranja;
 
-			q = build_rect(q, x0, y0, ancho, 16.0f, gris);
-			if (lleno > 1.0f)
-				q = build_rect(q, x0, y0, lleno, 16.0f,
-				               (alma >= alma_norma) ? amarillo : naranja);
-			// La marca de la norma, un poco mas alta que la barra para que se
-			// vea por encima del relleno.
-			q = build_rect(q, xn - 1.0f, y0 - 3.0f, 3.0f, 22.0f, blanco);
+			// Las x de la primera onda, con el ancho de cada diente sacado
+			// del ruido. Se generan hasta pasarse un diente del borde: la
+			// punta interpolada necesita SIEMPRE un vertice siguiente al que
+			// apuntar, aunque ese ya no se llegue a dibujar.
+			{
+				float xz = x0;
+
+				for (k = 0; na < 158; k++) {
+					ax[na++] = xz;
+					if (xz > x1) break;
+					xz += ancho_diente(k, 0);
+				}
+			}
+
+			// Y la segunda, en los puntos medios.
+			for (k = 0; k + 1 < na && nb < 158; k++)
+				bx[nb++] = (ax[k] + ax[k + 1]) * 0.5f;
+
+			q = onda_alma(q, ax, na, 0,  0, fin_x, c, 400, t_ruido);
+			q = onda_alma(q, bx, nb, 1, 23, fin_x, c, 900, t_ruido);
+
+			// La marca de la norma, donde esta el umbral de verdad.
+			q = linea(q, xn, ALMA_Y - ALMA_AMP - 5.0f,
+			          xn, ALMA_Y + ALMA_AMP + 5.0f, blanco, 460, t_ruido);
 		}
 
-		// Circulo del juez. Durante el Gogo Time se pone naranja: es lo unico
-		// que hace aqui el #GOGOSTART, porque con el reparto shin'uchi no
-		// toca la puntuacion (el x1,2 es del sistema viejo). Se mira la nota
-		// que toca ahora, que es lo mas barato que dice si estamos dentro.
-		q = build_circle(q, X_JUEZ, Y_CARRIL, RADIO_JUEZ,
-		                 (siguiente_nota < n_notas && notas[siguiente_nota].gogo)
-		                 ? naranja : blanco,
-		                 SEGMENTOS, PRIM_LINE_STRIP);
+		// Las reglas del carril. Sangran hasta el borde a proposito: son
+		// lineas horizontales y lo que se pierda por los lados no es
+		// informacion. Lo que se LEE se queda dentro de la zona segura.
+		q = linea(q, -SANGRE_X, Y_CARRIL + 57.0f, SANGRE_X, Y_CARRIL + 57.0f,
+		          gris, 300, t_ruido);
+		q = linea(q, -SANGRE_X, Y_CARRIL - 57.0f, SANGRE_X, Y_CARRIL - 57.0f,
+		          gris, 320, t_ruido);
+		q = linea(q, X_JUEZ + 59.0f, Y_CARRIL + 57.0f,
+		          X_JUEZ + 59.0f, Y_CARRIL - 57.0f, gris, 340, t_ruido);
 
-		// Aviso de juicio encima del juez
+		// El juez: dos aros concentricos y unos radios que los cruzan. Es una
+		// figura hecha de lineas, no una forma rellena, que es justo el
+		// lenguaje del estilo. Durante el Gogo Time se pone naranja.
+		{
+			color_t cj = (siguiente_nota < n_notas && notas[siguiente_nota].gogo)
+			             ? naranja : blanco;
+			int k;
+
+			q = aro(q, X_JUEZ, Y_CARRIL, RADIO_JUEZ,     16, cj, 0,  t_ruido);
+			q = aro(q, X_JUEZ, Y_CARRIL, RADIO_JUEZ_INT, 16, cj, 40, t_ruido);
+			for (k = 0; k < RADIOS_JUEZ; k++) {
+				float a = (float)k * (2.0f * (float)M_PI) / (float)RADIOS_JUEZ;
+				float ca = cosf(a), sa = sinf(a);
+				q = linea(q,
+				          X_JUEZ + RADIO_JUEZ_INT * ca,
+				          Y_CARRIL + RADIO_JUEZ_INT * sa,
+				          X_JUEZ + RADIO_JUEZ * ca,
+				          Y_CARRIL + RADIO_JUEZ * sa,
+				          cj, 80 + k * 4, t_ruido);
+			}
+		}
+
+		// Aviso de golpe: destello de lineas sobre el propio juez, no un
+		// circulo de color. Perfecto reparte rayos en TODAS las direcciones,
+		// bueno solo en las cuatro cardinales, asi que la diferencia se lee
+		// por la forma y no hay que fijarse en el color.
+		//
+		// El fallo no pinta nada a proposito: un golpe malo no merece
+		// celebracion, y el combo cayendo a cero ya lo dice.
 		if (ahora < juicio_hasta_ms && ultimo_juicio != JUICIO_NADA) {
-			color_t c = (ultimo_juicio == JUICIO_PERFECTO) ? blanco :
-			            (ultimo_juicio == JUICIO_BUENO)    ? amarillo : gris;
-			q = build_circle(q, X_JUEZ, Y_CARRIL + 70.0f, 12.0f, c,
-			                 8, PRIM_TRIANGLE_FAN);
+			float prog = 1.0f - (float)(juicio_hasta_ms - ahora) / 200.0f;
+
+			if (prog < 0.0f) prog = 0.0f;
+			if (ultimo_juicio == JUICIO_PERFECTO)
+				q = destello(q, X_JUEZ, Y_CARRIL, 8, prog, amarillo, 360, t_ruido);
+			else if (ultimo_juicio == JUICIO_BUENO)
+				q = destello(q, X_JUEZ, Y_CARRIL, 4, prog, blanco, 380, t_ruido);
+			else
+				// El fallo tambien avisa ahora. Antes no pintaba nada, y eso
+				// dejaba sin distinguir "le diste mal" de "ni la tocaste",
+				// que mientras juegas es informacion util.
+				q = desanimo(q, X_JUEZ, Y_CARRIL, prog, azul, 340, t_ruido);
+		}
+
+		// Globo recien reventado: trazos rectos hacia fuera.
+		if (ahora < globo_roto_hasta) {
+			float prog = 1.0f - (float)(globo_roto_hasta - ahora) / 400.0f;
+			if (prog < 0.0f) prog = 0.0f;
+			q = destello(q, X_JUEZ, Y_CARRIL, 8, prog, naranja, 170, t_ruido);
 		}
 
 		// Notas: la posicion sale del tiempo, no de un contador de frames.
@@ -2589,6 +3325,25 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 			if (dt > ventana_dibujo_ms) break;
 			if (notas[i].resuelta) continue;
 			if (x > 420.0f) continue;
+			// Y por la izquierda tambien. Con un #SCROLL negativo las notas
+			// viajan al reves y sin esto ninguna se descartaria nunca: se
+			// dibujarian TODAS las de la ventana, que pueden ser cientos,
+			// fuera de pantalla.
+			//
+			// Rodillos y globos NO entran en este corte. Los dos se dibujan
+			// en un sitio distinto del que dice su "x": el globo se clava en
+			// el juez mientras lo aporreas y el rodillo se recorta solo mas
+			// abajo. Cortandolos por x, el globo desaparecia al segundo de
+			// abrirse y seguia contando golpes sin verse.
+			if (x < -400.0f && notas[i].tipo != NOTA_RODILLO &&
+			    notas[i].tipo != NOTA_GLOBO) continue;
+
+			// Tope duro de figuras por fotograma. Jugando no se llega nunca
+			// (no caben ni veinte notas en pantalla), pero pasarse del
+			// paquete no da un dibujo feo: corrompe memoria y tumba la
+			// consola. Con el anillo cada nota cuesta el doble, asi que el
+			// margen que habia antes ya no es el mismo.
+			if (++dibujadas > 64) break;
 
 			r = notas[i].grande ? RADIO_GRANDE : RADIO_NOTA;
 
@@ -2602,42 +3357,111 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 				float a = x  < -340.0f ? -340.0f : x;
 				float b = x2 >  420.0f ?  420.0f : x2;
 
+				if (estilo_nota == ESTILO_ANILLO) {
+					if (b > a) {
+						q = linea(q, a, Y_CARRIL + r, b, Y_CARRIL + r,
+						          amarillo, 200, t_ruido);
+						q = linea(q, a, Y_CARRIL - r, b, Y_CARRIL - r,
+						          amarillo, 210, t_ruido);
+					}
+					if (x  > -340.0f)
+						q = aro(q, x,  Y_CARRIL, r, LADOS_NOTA, amarillo,
+						        220, t_ruido);
+					if (x2 <  420.0f)
+						q = aro(q, x2, Y_CARRIL, r, LADOS_NOTA, amarillo,
+						        240, t_ruido);
+					continue;
+				}
+
 				if (b > a)
 					q = build_rect(q, a, Y_CARRIL - r, b - a, r * 2.0f,
 					               amarillo);
-				if (x > -340.0f)
-					q = build_circle(q, x, Y_CARRIL, r, amarillo,
-					                 SEGMENTOS, PRIM_TRIANGLE_FAN);
-				if (x2 < 420.0f)
-					q = build_circle(q, x2, Y_CARRIL, r, amarillo,
-					                 SEGMENTOS, PRIM_TRIANGLE_FAN);
+				{
+					float dx[64], dy[64];
+					int nv;
+
+					if (x > -340.0f) {
+						nv = vertices_disco(dx, dy, x, Y_CARRIL, r,
+						                    LADOS_NOTA, 220, t_ruido);
+						q = relleno(q, dx, dy, nv, x, Y_CARRIL, amarillo);
+					}
+					if (x2 < 420.0f) {
+						nv = vertices_disco(dx, dy, x2, Y_CARRIL, r,
+						                    LADOS_NOTA, 240, t_ruido);
+						q = relleno(q, dx, dy, nv, x2, Y_CARRIL, amarillo);
+					}
+				}
 				continue;
 			}
 
 			if (notas[i].tipo == NOTA_GLOBO) {
 				// Mientras esta abierto se queda clavado en el juez, que es
 				// donde hay que aporrearlo; antes de llegar viene rodando
-				// como una nota mas. El numero que falta lo pinta el HUD,
-				// porque el texto va siempre al final de la cadena.
+				// como una nota mas.
+				//
+				// Y se HINCHA: el radio va de medio a radio y medio segun los
+				// golpes que llevas, asi que se ve crecer de verdad en vez de
+				// tener que leer el numero. Debajo cuelga el nudo.
 				float xg = (ahora >= notas[i].tiempo_ms) ? X_JUEZ : x;
-				q = build_circle(q, xg, Y_CARRIL, RADIO_GRANDE, naranja,
-				                 SEGMENTOS, PRIM_TRIANGLE_FAN);
-				q = build_circle(q, xg, Y_CARRIL, RADIO_GRANDE, blanco,
-				                 SEGMENTOS, PRIM_LINE_STRIP);
+				float frac = (notas[i].golpes > 0)
+				             ? (float)notas[i].dados / (float)notas[i].golpes
+				             : 0.0f;
+				float rg;
+				float nx[3], ny[3];
+
+				if (frac > 1.0f) frac = 1.0f;
+				rg = RADIO_GRANDE * (0.55f + 0.75f * frac);
+
+				if (estilo_nota == ESTILO_ANILLO) {
+					q = aro(q, xg, Y_CARRIL, rg, LADOS_NOTA, naranja,
+					        120, t_ruido);
+				} else {
+					float dx[64], dy[64];
+					int nv = vertices_disco(dx, dy, xg, Y_CARRIL, rg,
+					                        LADOS_NOTA, 120, t_ruido);
+
+					q = relleno(q, dx, dy, nv, xg, Y_CARRIL, naranja);
+					q = trazo(q, dx, dy, nv, blanco);
+				}
+
+				nx[0] = xg - 5.0f;  ny[0] = Y_CARRIL - rg;
+				nx[1] = xg;         ny[1] = Y_CARRIL - rg - 9.0f;
+				nx[2] = xg + 5.0f;  ny[2] = Y_CARRIL - rg;
+				q = poli(q, nx, ny, 3, 0, naranja, 150, t_ruido);
 				continue;
 			}
 
-			q = build_circle(q, x, Y_CARRIL, r,
-			                 notas[i].tipo == NOTA_DON ? rojo : azul,
-			                 SEGMENTOS, PRIM_TRIANGLE_FAN);
+			{
+				color_t cn = (notas[i].tipo == NOTA_DON) ? rojo : azul;
 
-			// Las grandes llevan aro para que se distingan de una normal que
-			// venga con otra escala. De momento valen con un solo golpe: en
-			// el taiko de verdad hay que dar con los dos parches a la vez, y
-			// eso llegara con el mapeo a cuatro botones. NO esta hecho.
-			if (notas[i].grande)
-				q = build_circle(q, x, Y_CARRIL, r, blanco,
-				                 SEGMENTOS, PRIM_LINE_STRIP);
+				if (estilo_nota == ESTILO_ANILLO) {
+					// El color vive en el TRAZO y no en el relleno. No se
+					// puede quitar aunque el estilo pida blanco: rojo o azul
+					// es con que mano golpeas, y en Oni tienes 100 ms para
+					// decidirlo. Ahi la legibilidad gana al estilo.
+					q = aro(q, x, Y_CARRIL, r, LADOS_NOTA, cn, i * 7, t_ruido);
+					q = aro(q, x, Y_CARRIL, r - GROSOR_ANILLO, LADOS_NOTA, cn,
+					        i * 7 + 30, t_ruido);
+					if (notas[i].grande)
+						q = aro(q, x, Y_CARRIL, r + 5.0f, LADOS_NOTA, blanco,
+						        i * 7 + 60, t_ruido);
+				} else {
+					// Relleno macizo pero con la SILUETA temblando y girando:
+					// el color se mantiene entero (que es lo que hace que se
+					// lea rapido) y lo que se mueve es la forma. El contorno
+					// sale de los mismos vertices, asi que por mucho ruido que
+					// se meta nunca se despega del relleno.
+					float dx[64], dy[64];
+					int nv = vertices_disco(dx, dy, x, Y_CARRIL, r,
+					                        LADOS_NOTA, i * 7, t_ruido);
+
+					q = relleno(q, dx, dy, nv, x, Y_CARRIL, cn);
+					// Las grandes llevan aro blanco, para que se distingan de
+					// una normal que venga con otra escala.
+					if (notas[i].grande)
+						q = trazo(q, dx, dy, nv, blanco);
+				}
+			}
 		}
 
 		// HUD. Va al final de la cadena a proposito: el texto estampa la Z
@@ -2646,27 +3470,20 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 			char linea[64];
 			int t;
 
+			// Titulo, puntuacion y combo CENTRADOS, uno sobre otro, como
+			// en la plantilla. Antes iban pegados a las esquinas.
 			{
 				char corte[48];
 
-				recorte_sjis(corte, sizeof(corte), can->titulo, 34);
-				snprintf(linea, sizeof(linea), "%s  [%s]", corte,
+				recorte_sjis(corte, sizeof(corte), can->titulo, 30);
+				snprintf(linea, sizeof(linea), "%s - %s", corte,
 				         nombre_curso[curso]);
 			}
-			q = texto(q, -SEG_X, SEG_Y, linea, blanco);
-			snprintf(linea, sizeof(linea), "%d COMBO", combo);
-			q = texto(q, 150.0f, SEG_Y, linea, amarillo);
+			q = texto_centrado(q, SEG_Y - 6.0f, linea, blanco);
 			snprintf(linea, sizeof(linea), "%d", puntos);
-			q = texto(q, 150.0f, SEG_Y - 26.0f, linea, blanco);
-			// El 魂 ("alma") delante de la barra, como en el juego de
-			// verdad. Va en Shift-JIS crudo y no como literal UTF-8 porque
-			// es constante: convertirlo en cada fotograma no tendria sentido.
-			// 0x8DAC, dentro del rango que KROM trae (JIS nivel 1).
-			//
-			// A x=-180 y no mas a la izquierda a proposito: el aviso del
-			// globo se pinta en X_JUEZ-30 = -280 y con "GLOBO 12" llega hasta
-			// -216. Quedan 36 px de aire.
-			q = texto(q, -180.0f, 150.0f, "\x8d" "\xac", gris);
+			q = texto_centrado(q, SEG_Y - 42.0f, linea, blanco);
+			snprintf(linea, sizeof(linea), "%d COMBO", combo);
+			q = texto_centrado(q, SEG_Y - 74.0f, linea, amarillo);
 
 			// Calibrando, cuantos golpes llevan enganchados de los 20 que
 			// hacen falta para que la mediana valga algo. Sin esto no hay
@@ -2709,9 +3526,20 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 		draw_wait_finish();
 		graph_wait_vsync();
 
-		if (!fin && (salir || (audio_terminado && siguiente_nota >= n_notas))) {
-			LOG("Resultado: %d perfectos, %d buenos, %d fallos (de %d)\n",
-			    perfectos, buenos, fallos, n_notas);
+		// Fin de partida.
+		//
+		// Lo normal es esperar a que se acabe el AUDIO: una cancion de verdad
+		// suele tener cola despues de la ultima nota y cortarla ahi seria
+		// raro. Pero las generadas (metronomo y nivel de prueba) tiran de un
+		// .ogg empotrado que dura mucho mas que su chart, y se quedaban
+		// sonando minutos sin una sola nota y sin forma de acabar que no
+		// fuera la pausa. Para esas se sale en cuanto pasa la ultima nota.
+		if (!fin && (salir ||
+		             (audio_terminado && siguiente_nota >= n_notas) ||
+		             (can->generada && siguiente_nota >= n_notas &&
+		              ahora > fin_chart_ms + 2500))) {
+			LOG("Resultado: %d perfectos, %d buenos, %d bad, %d perdidas (de %d)\n",
+			    perfectos, buenos, malos, perdidas, n_notas);
 			LOG("  %d puntos (%d por nota), alma %d%% de %d%% -> %s\n",
 			    puntos, puntos_nota, (int)alma, alma_norma,
 			    (alma >= alma_norma) ? "APROBADO" : "NO SUPERADO");
@@ -2753,11 +3581,11 @@ static int render(framebuffer_t *frame, zbuffer_t *z, packet_t *packets[2],
 			//
 			// "VOLVER AL MENU" sigue sin guardar nada, y eso no cambia: esa
 			// opcion no llega a la pantalla de resultados.
+			// La marca se guarda igual, aunque la pantalla nueva ya no anuncie
+			// que la has batido: eso se quito con el rediseno.
 			if (puntos > mejor_puntos &&
-			    guardar_puntos(can, curso, puntos) == 0) {
-				record       = 1;
+			    guardar_puntos(can, curso, puntos) == 0)
 				mejor_puntos = puntos;
-			}
 		}
 	}
 
@@ -4086,11 +4914,14 @@ static int pantalla_bienvenida(framebuffer_t *frame, zbuffer_t *z,
 
 #define OPC_MUSICA   0
 #define OPC_SONIDO   1
-#define OPC_BORRAR   2
-#define OPC_METRO    3
-#define OPC_PRUEBA   4
-#define OPC_SALIR    5
-#define N_OPCIONES   6
+#define OPC_NOTAS    2   // disco o anillo
+// El temblor NO esta aqui: se toca dentro de la cancion con SELECT y L2/R2,
+// que es el unico sitio donde se ve lo que hace mientras se cambia.
+#define OPC_BORRAR   3
+#define OPC_METRO    4
+#define OPC_PRUEBA   5
+#define OPC_SALIR    6
+#define N_OPCIONES   7
 
 // La barra de rayitas, tal cual se enseña: llenas con '|' y vacias con '*'.
 static void barra_volumen(char *dst, size_t n, const char *etiqueta, int valor)
@@ -4186,6 +5017,10 @@ static int pantalla_opciones(framebuffer_t *frame, zbuffer_t *z,
 				if (vol_musica > VOL_PASOS) vol_musica = VOL_PASOS;
 				aplicar_volumen_musica();
 				cambiado = 1;
+			} else if (sel == OPC_NOTAS && (rojo_izq || rojo_der)) {
+				estilo_nota = (estilo_nota == ESTILO_DISCO) ? ESTILO_ANILLO
+				                                            : ESTILO_DISCO;
+				cambiado = 1;
 			} else if (sel == OPC_SONIDO && (rojo_izq || rojo_der)) {
 				vol_sonido += rojo_der ? 1 : -1;
 				if (vol_sonido < 0)         vol_sonido = 0;
@@ -4261,6 +5096,12 @@ static int pantalla_opciones(framebuffer_t *frame, zbuffer_t *z,
 					barra_volumen(texto_fila, sizeof(texto_fila),
 					              "Sonido:", vol_sonido);
 					break;
+				case OPC_NOTAS:
+					snprintf(texto_fila, sizeof(texto_fila),
+					         "Notas: %s",
+					         (estilo_nota == ESTILO_DISCO) ? "circulo lleno"
+					                                       : "anillo");
+					break;
 				case OPC_BORRAR:
 					snprintf(texto_fila, sizeof(texto_fila),
 					         "Borrar perfil (y puntuaciones)");
@@ -4280,12 +5121,14 @@ static int pantalla_opciones(framebuffer_t *frame, zbuffer_t *z,
 				}
 
 				snprintf(linea, sizeof(linea), "%c %s", cursor, texto_fila);
-				q = texto(q, -230.0f, 96.0f - i * 34.0f, linea, col);
+				// 30 y no 34 de separacion: con la fila de notas son siete, y a
+				// 34 la ultima se junta con la linea de ayuda de abajo.
+				q = texto(q, -230.0f, 96.0f - i * 30.0f, linea, col);
 			}
 
 			// La ayuda cambia con la fila porque los rojos hacen dos cosas
 			// distintas: en una barra suben y bajan, en lo demas eligen.
-			if (sel == OPC_MUSICA || sel == OPC_SONIDO)
+			if (sel == OPC_MUSICA || sel == OPC_SONIDO || sel == OPC_NOTAS)
 				q = texto(q, -230.0f, -110.0f,
 				          "AZUL mueve   ROJO izq baja / der sube", gris);
 			else
@@ -4922,6 +5765,7 @@ int main(int argc, char *argv[])
 	// Los ajustes viven en el pen, asi que esto va DESPUES de cargar los
 	// modulos y antes de que el GS tome el control, que es mientras todavia
 	// se puede escribir en pantalla si algo va mal.
+	iniciar_ruido();
 	cargar_config();
 	LOG("Ajustes: %s (offset %d ms, musica %d, sonido %d)\n",
 	    config_estado, offset_ms, vol_musica, vol_sonido);
