@@ -7,6 +7,10 @@ or with a pad.
 
 It runs on actual hardware, not just in an emulator.
 
+## Demo
+
+<video src="./demo-vib-tatsuji.mp4" controls muted playsinline width="100%"></video>
+
 ## What's there
 
 - **The song clock comes from the audio**, not from counting frames. Notes live
