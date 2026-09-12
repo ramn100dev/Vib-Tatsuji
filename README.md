@@ -9,7 +9,9 @@ It runs on actual hardware, not just in an emulator.
 
 ## Demo
 
-<video src="./demo-vib-tatsuji.mp4" controls muted playsinline width="100%"></video>
+![Demo](./demo-vib-tatsuji.gif)
+
+[▶ Ver video completo con sonido](./demo-vib-tatsuji.mp4)
 
 ## What's there
 
